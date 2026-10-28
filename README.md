@@ -14,7 +14,7 @@ The kit contains:
 4. **Arch Linux ARM install**, with a desktop or headless.
 5. **guacamole-tools**: a battery-care service, thermal limits, the *Guacamole Panel* app, a full-screen *Server Monitor* and the `guac` CLI.
 
-> ⚠️ **This wipes Android and its user data.** You need an unlocked bootloader, and you should know how to unbrick with the **MSM Download Tool** for your model before you start. Nothing here touches `persist`, `modemst1/2`, `fsg` or `fsc`, but take the backup in step 1 anyway. You use this kit at your own risk.
+> ⚠️ **This wipes Android and its user data.** Start from stock **OxygenOS 12** (see [Starting point](#starting-point-what-the-phone-should-be-running)) with the bootloader unlocked, and know how to unbrick with the **MSM Download Tool** for your model before you start. Nothing here touches `persist`, `modemst1/2`, `fsg` or `fsc`, but take the backup in step 1 anyway. You use this kit at your own risk.
 
 ## What works
 
@@ -34,9 +34,29 @@ The kit contains:
 - **Speakers are quiet,** and there's no speaker protection. Keep the volume reasonable.
 - **The UFS link is capped at HS-G3.** At HS-G4 it silently corrupts writes. **Never boot a distro's own kernel:** only kernels built with `build-kernel.sh` have the cap.
 
+## Starting point: what the phone should be running
+
+Start from **stock OxygenOS 12** (Android 12), updated to the **last official release** (December 2022 security patch). This kit was tested with that, and the order matters:
+
+1. **Get onto OxygenOS 12.** Update stock OxygenOS to the final OxygenOS 12 build through the normal system updater.
+   - If the phone runs a custom ROM, or is in an unknown state, restore it with the **MSM Download Tool** for your model first, then update with OTAs up to the last OxygenOS 12.
+2. **Unlock the bootloader.** Enable *OEM unlocking* in Developer options, then run `fastboot oem unlock`. This wipes Android.
+   - If `fastboot oem unlock` fails "for technical reason", MSM-restore and try again.
+3. **Boot OxygenOS once** after the unlock. Skip the setup, but let it reach the home screen.
+4. **Continue with step 1 below** (backup) while Android is still intact.
+
+Why this matters:
+
+- **Your Android version stays in charge of booting.** U-Boot replaces only the `boot` partitions. The bootloader (ABL, XBL) and the firmware partitions stay whatever your Android version installed. U-Boot and the boot images here were tested on OxygenOS 12's bootloader. The other slot held OxygenOS 11, so firmware from either version is fine, but older ones (OxygenOS 10) haven't been tried.
+- **You don't install the LineageOS zip.** `build-firmware.sh` only reads Wi-Fi and Bluetooth firmware out of it. Download it; don't flash it.
+- **Models:** tested on the global/EU model (GM1913, GM1910 hardware).
+  - **GM1917** (US unlocked) uses the same hardware.
+  - **GM1915** (T-Mobile) must be converted to the global firmware with the MSM tool and unlocked first.
+  - The **5G model (GM1920)** is different hardware and **won't work**.
+
 ## What you need
 
-- **The phone:** unlocked bootloader (`fastboot oem unlock`), charged.
+- **The phone:** on OxygenOS 12 as above, bootloader unlocked, charged.
 - **A Windows PC:**
   - [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`, `fastboot`) and the Google USB driver.
   - **WSL2** with Ubuntu, plus `usbipd`. In an admin PowerShell, run `wsl --install -d Ubuntu`, then `winget install usbipd`.
