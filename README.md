@@ -62,7 +62,7 @@ Why this matters:
   - **WSL2** with Ubuntu, plus `usbipd`. In an admin PowerShell, run `wsl --install -d Ubuntu`, then `winget install usbipd`.
   - A Linux PC works instead of Windows + WSL. Run the `.sh` scripts the same way, and use your own tools in place of the `.ps1` scripts.
 - **A LineageOS OTA zip for guacamole:** `build-firmware.sh` takes the Wi-Fi, Bluetooth and DSP firmware from it.
-- **Build tools in Ubuntu (WSL):**
+- **Build tools** (a Linux PC with Ubuntu/Debian, or Ubuntu in WSL):
 
 ```bash
 sudo apt update && sudo apt install build-essential gcc-aarch64-linux-gnu device-tree-compiler flex bison \
@@ -76,7 +76,7 @@ Run `.ps1` scripts from PowerShell in the kit folder:
 powershell -ExecutionPolicy Bypass -File .\scripts\<name>.ps1 ...
 ```
 
-Run `.sh` scripts from Ubuntu, with the kit copied into your WSL home. Building on `/mnt/c` is very slow.
+Run `.sh` scripts in a Linux terminal, or in Ubuntu under WSL. On WSL, copy the kit into your WSL home first (`cp -r /mnt/c/.../guacamole-linux-kit ~`): building on `/mnt/c` is very slow.
 
 **Key combos**
 - **Fastboot:** with the phone off, hold Vol Up + Vol Down + Power.
@@ -102,7 +102,7 @@ The backup also includes `boot`, `dtbo`, `vbmeta`, `modem`, `dsp` and `bluetooth
 
 ## 2. Build and install U-Boot
 
-**Build it** (Ubuntu):
+**Build it** (Linux or WSL):
 
 ```bash
 bash scripts/build-uboot.sh
@@ -126,7 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\flash-uboot.ps1 -Mode Install
 
 If you ever see "the current image has been destroyed", run `fastboot --set-active=a`. The installed system marks its slot as successful at every boot (`ab-mark-successful.service`), so this shouldn't happen again.
 
-## 3. Build the kernel and the firmware (Ubuntu)
+## 3. Build the kernel and the firmware (Linux or WSL)
 
 ```bash
 bash scripts/build-kernel.sh                                        # 20-40 min -> build/guacamole-kernel-<release>.tar.gz
@@ -149,17 +149,22 @@ bash scripts/build-firmware.sh ~/lineage-*-guacamole-signed.zip     # -> build/g
 
 1. **Put the phone in mass-storage mode.** Boot to U-Boot, hold Vol Down, and choose **Enable USB mass storage**.
    **When Windows offers to format or initialise the disk, click Cancel. Never accept.**
-2. **Attach the disk to WSL** (admin PowerShell):
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\scripts\wsl-attach-phone.ps1
-   ```
+2. **Find the disk.**
+   - **WSL:** attach it from an admin PowerShell:
+     ```powershell
+     powershell -ExecutionPolicy Bypass -File .\scripts\wsl-attach-phone.ps1
+     ```
+   - **Linux PC:** it simply appears. Check `lsblk`.
+
    The phone is the ~238 GB disk with 4096-byte sectors and a `persist` partition, for example `/dev/sdd`.
-3. **Install** (Ubuntu). `--partition` is only for the first time: it splits `userdata` into a 4 GiB placeholder, a 1 GiB ESP and `linux1` (the rest), after asking you to type `ERASE-USERDATA`.
+3. **Install** (Linux or WSL). `--partition` is only for the first time: it splits `userdata` into a 4 GiB placeholder, a 1 GiB ESP and `linux1` (the rest), after asking you to type `ERASE-USERDATA`.
    ```bash
    sudo bash scripts/install-arch.sh --disk /dev/sdX --partition --gui        # KDE Plasma desktop
    sudo bash scripts/install-arch.sh --disk /dev/sdX --partition --headless   # no desktop (server)
    ```
-4. **Detach the disk** with `.\scripts\wsl-attach-phone.ps1 -Detach`, then reboot the phone.
+4. **Release the disk and reboot the phone.**
+   - **WSL:** detach it with `.\scripts\wsl-attach-phone.ps1 -Detach`.
+   - **Linux PC:** run `sync`.
 
 `partition-ufs.sh` refuses any disk that isn't the phone's LUN0, and saves a GPT backup (`gpt-lun0-backup-*.sgdisk`) before changing anything. Keep that file.
 

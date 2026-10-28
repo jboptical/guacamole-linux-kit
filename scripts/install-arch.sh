@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install Arch Linux ARM on the OnePlus 7 Pro from a Linux PC or WSL2, with the
-# phone in U-Boot "USB mass storage" mode (see README, steps 4-6).
+# phone in U-Boot "USB mass storage" mode (see README, steps 4 and 5).
 #
 #   sudo bash scripts/install-arch.sh --disk /dev/sdX [--gui | --headless]
 #        [--partition]          # first split userdata into userdata + esp + linux1
