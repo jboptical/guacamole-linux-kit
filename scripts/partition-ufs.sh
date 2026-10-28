@@ -25,7 +25,8 @@ for t in sgdisk blockdev mkfs.vfat mkfs.ext4 partprobe; do command -v $t >/dev/n
 SS=$(blockdev --getss "$DEV")
 BYTES=$(blockdev --getsize64 "$DEV")
 [ "$SS" = 4096 ] || die "logical sector size is $SS, expected 4096 (UFS). Wrong disk?"
-[ "$BYTES" -gt $((200*1000**3)) ] && [ "$BYTES" -lt $((260*1000**3)) ] || die "size $BYTES not ~238 GB. Wrong disk?"
+# 128 GB phones: LUN0 is roughly 110-120 GB; 256 GB phones: ~238 GB
+[ "$BYTES" -gt $((100*1000**3)) ] && [ "$BYTES" -lt $((260*1000**3)) ] || die "size $BYTES is not a OnePlus 7 Pro (128 or 256 GB) LUN0. Wrong disk?"
 TABLE=$(sgdisk -p "$DEV") || die "no GPT on $DEV"
 echo "$TABLE" | grep -qw persist || die "no 'persist' partition: this is not LUN0 of the OnePlus"
 N_UD=$(echo "$TABLE" | awk '$1 ~ /^[0-9]+$/ && $NF=="userdata"{print $1}')

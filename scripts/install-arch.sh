@@ -22,7 +22,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --partition) PART=1; shift;; --kernel) KPKG=$2; shift 2;; --firmware) FWTAR=$2; shift 2;;
   *) die "unknown arg $1 (see the top of this script)";; esac; done
 [ "$(id -u)" = 0 ] || die "run with sudo"
-[ -b "${DISK:-}" ] || die "--disk /dev/sdX (the phone's ~238 GB disk with 4096-byte sectors) is required"
+[ -b "${DISK:-}" ] || die "--disk /dev/sdX (the phone's disk: ~238 GB (256 GB model) or ~119 GB (128 GB model), 4096-byte sectors) is required"
 for t in curl md5sum lsblk blkid; do command -v $t >/dev/null || die "missing $t"; done
 
 KPKG=${KPKG:-$(ls -t "$PWD"/build/guacamole-kernel-*.tar.gz "$KIT"/build/guacamole-kernel-*.tar.gz 2>/dev/null | head -1 || true)}

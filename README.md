@@ -53,6 +53,7 @@ Why this matters:
   - **GM1917** (US unlocked) uses the same hardware.
   - **GM1915** (T-Mobile) must be converted to the global firmware with the MSM tool and unlocked first.
   - The **5G model (GM1920)** is different hardware and **won't work**.
+- **Memory and storage:** the 6 GB/128 GB, 8 GB/256 GB and 12 GB/256 GB versions are all supported. The bootloader tells Linux how much RAM there is, and the installer sizes the Linux partition to the storage. Only 12 GB/256 GB has been tested on a real phone.
 
 ## What you need
 
@@ -156,7 +157,7 @@ bash scripts/build-firmware.sh ~/lineage-*-guacamole-signed.zip     # -> build/g
      ```
    - **Linux PC:** it simply appears. Check `lsblk`.
 
-   The phone is the ~238 GB disk with 4096-byte sectors and a `persist` partition, for example `/dev/sdd`.
+   The phone is the disk with 4096-byte sectors and a `persist` partition, about 238 GB on the 256 GB model or about 119 GB on the 128 GB model, for example `/dev/sdd`.
 3. **Install** (Linux or WSL). `--partition` is only for the first time: it splits `userdata` into a 4 GiB placeholder, a 1 GiB ESP and `linux1` (the rest), after asking you to type `ERASE-USERDATA`.
    ```bash
    sudo bash scripts/install-arch.sh --disk /dev/sdX --partition --gui        # KDE Plasma desktop
