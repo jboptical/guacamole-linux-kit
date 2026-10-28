@@ -64,7 +64,10 @@ Why this matters:
   - [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`, `fastboot`) and the Google USB driver.
   - **WSL2** with Ubuntu, plus `usbipd`. In an admin PowerShell, run `wsl --install -d Ubuntu`, then `winget install usbipd`.
   - A Linux PC works instead of Windows + WSL. Run the `.sh` scripts the same way, and use your own tools in place of the `.ps1` scripts.
-- **A LineageOS OTA zip for guacamole:** `build-firmware.sh` takes the Wi-Fi, Bluetooth and DSP firmware from it.
+- **A LineageOS zip for guacamole:** `build-firmware.sh` takes the Wi-Fi, Bluetooth and DSP firmware from it. You only download it; you don't install it.
+  - **Where:** get the current build from [download.lineageos.org/devices/guacamole/builds](https://download.lineageos.org/devices/guacamole/builds). The file is called `lineage-<version>-<date>-nightly-guacamole-signed.zip`, about 1.2 GB. Older builds are removed after a while.
+  - **Tested with:** an October 2026 build (Android 17, security patch 2026-10-01). Its vendor firmware comes from OxygenOS 12. Newer builds should work too, since only these firmware files are used.
+- **TWRP for guacamole,** for the backup in step 1: [twrp.me/oneplus/oneplus7pro.html](https://twrp.me/oneplus/oneplus7pro.html) (download `twrp-<version>-guacamole.img`). It's only booted from RAM, never installed.
 - **Build tools** (a Linux PC with Ubuntu/Debian, or Ubuntu in WSL):
 
 ```bash
@@ -102,7 +105,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\<name>.ps1 ...
 
 `persist`, `modemst1/2`, `fsg` and `fsc` hold your IMEI, radio and sensor calibration, and MAC addresses. No update can bring them back.
 
-1. Boot TWRP for guacamole from RAM: `fastboot boot twrp-*-guacamole.img`.
+1. Boot TWRP for guacamole (see *What you need*) from RAM, with the phone in fastboot: `fastboot boot twrp-<version>-guacamole.img`.
 2. Run the backup:
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\scripts\backup-partitions.ps1
@@ -143,7 +146,7 @@ If you ever see "the current image has been destroyed", run `fastboot --set-acti
 
 ```bash
 bash scripts/build-kernel.sh                                        # 20-40 min -> build/guacamole-kernel-<release>.tar.gz
-bash scripts/build-firmware.sh ~/lineage-*-guacamole-signed.zip     # -> build/guacamole-firmware.tar.gz
+bash scripts/build-firmware.sh ~/lineage-*-guacamole-signed.zip     # the zip you downloaded -> build/guacamole-firmware.tar.gz
 ```
 
 **The kernel** is sm8150-mainline `v6.17.0-sm8150` (hash-checked), plus guacamole_nura's 24 patches, plus this kit's patches in `patches-kernel/`:
