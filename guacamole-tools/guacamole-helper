@@ -70,7 +70,7 @@ swap)
   fi
   if grep -q "^$SF " /proc/swaps; then swapoff "$SF"; fi
   rm -f "$SF"
-  sed -i "\|^$SF[[:space:]]|d" /etc/fstab
+  sed -i "\|^${SF}[[:space:]]|d" /etc/fstab
   if [ "$2" = off ]; then
     rm -f /etc/sysctl.d/90-guacamole-swap.conf
     sysctl -q vm.swappiness=60

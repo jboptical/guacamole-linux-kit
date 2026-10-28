@@ -1,18 +1,18 @@
 #!/bin/sh
-# Run ON THE PHONE as root (Arch Linux ARM), from the linux-kit folder:
+# Run ON THE PHONE as root (Arch Linux ARM), from the kit folder:
 #   sh scripts/setup-sensors.sh
 # Sensors (accelerometer for auto-rotate, light, proximity) through the SLPI
 # sensor DSP, following guacamole_nura (see sensors/NURA_COMMIT):
 #   SLPI remoteproc -> /dev/fastrpc-sdsp -> hexagonrpcd (serves /usr/share/qcom)
 #   -> iio-sensor-proxy (libssc, QMI over QRTR) -> net.hadess.SensorProxy -> KWin
-# Reads the stock vendor_b and dsp_b partitions READ-ONLY (ro,noload) for the
+# Reads the stock vendor and dsp partitions (slot b, else a) READ-ONLY (ro,noload) for the
 # sensor config and DSP libraries, and persist with debugfs (never mounted).
 # Needs a reboot afterwards: the SLPI cannot be restarted hot.
 set -eu
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 KIT=$(cd "$(dirname "$0")/.." && pwd)
 S="$KIT/sensors"
-[ -f "$S/hexagonrpcd/0001-serve-writable-files.patch" ] || { echo "missing $S (copy the whole linux-kit folder)"; exit 1; }
+[ -f "$S/hexagonrpcd/0001-serve-writable-files.patch" ] || { echo "missing $S (copy the whole kit folder)"; exit 1; }
 
 echo "== 1/6 packages"
 pacman -S --needed --noconfirm base-devel meson curl e2fsprogs iio-sensor-proxy libssc qt6-sensors
@@ -44,11 +44,21 @@ Q=/usr/share/qcom
 M=$(mktemp -d)
 rm -rf "$Q/sensors/config" "$Q/sdsp"
 mkdir -p "$Q/sensors" "$Q/socinfo"
-mount -o ro,noload /dev/disk/by-partlabel/vendor_b "$M"
+# the stock files can be on either Android slot (whichever OxygenOS last
+# installed); take the first slot that has them, b first (SENSOR_SLOT=a|b forces one)
+SLOT=
+for s in ${SENSOR_SLOT:-b a}; do
+  if mount -o ro,noload "/dev/disk/by-partlabel/vendor_$s" "$M" 2>/dev/null; then
+    if [ -f "$M/etc/sensors/sns_reg_config" ] && [ -d "$M/etc/sensors/config" ]; then SLOT=$s; break; fi
+    umount "$M"
+  fi
+done
+[ -n "$SLOT" ] || { echo "no stock vendor partition with sensor files (vendor_a/vendor_b)"; rmdir "$M"; exit 1; }
+echo "   using the stock files from slot $SLOT"
 cp -r "$M/etc/sensors/config" "$Q/sensors/config"
 install -m644 "$M/etc/sensors/sns_reg_config" "$Q/sensors/sns_reg.conf"
 umount "$M"
-mount -o ro,noload /dev/disk/by-partlabel/dsp_b "$M"
+mount -o ro,noload "/dev/disk/by-partlabel/dsp_$SLOT" "$M"
 cp -r "$M/sdsp" "$Q/sdsp"
 umount "$M"; rmdir "$M"
 printf MTP > "$Q/socinfo/hw_platform"

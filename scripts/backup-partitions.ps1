@@ -5,7 +5,7 @@
   Needs a ROOT adb shell on the phone: TWRP or LineageOS recovery booted with
   `fastboot boot <recovery>.img`, or rooted Android (Magisk).
 
-  Run from the linux-kit folder:
+  Run from the kit folder:
     powershell -ExecutionPolicy Bypass -File .\scripts\backup-partitions.ps1
 
   Result: .\guacamole-backup-<date>\  -- keep it PRIVATE (contains IMEI/keys)

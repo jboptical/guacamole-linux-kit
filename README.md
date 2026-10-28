@@ -16,6 +16,8 @@ The kit contains:
 
 > ⚠️ **This wipes Android and its user data.** Start from stock **OxygenOS 12** (see [Starting point](#starting-point-what-the-phone-should-be-running)) with the bootloader unlocked, and know how to unbrick with the **MSM Download Tool** for your model before you start. Nothing here touches `persist`, `modemst1/2`, `fsg` or `fsc`, but take the backup in step 1 anyway. You use this kit at your own risk.
 
+> 🤖 **Made with AI assistance.** Most of the scripts, the kit's kernel patches (0101–0105) and this documentation were written with an AI assistant (Anthropic's Claude), working with the author step by step on a real phone. The author ran and checked the results on their own OnePlus 7 Pro (12 GB/256 GB), and the README says which parts are untested. AI-written code can still be wrong in ways that look plausible, so read the scripts before running them as root, especially anything that writes to the phone's storage. There is no warranty (see LICENSE). Bug reports and fixes are welcome.
+
 ## What works
 
 | Works | Doesn't (yet) |
@@ -71,13 +73,23 @@ sudo apt update && sudo apt install build-essential gcc-aarch64-linux-gnu device
   cpio kmod gdisk dosfstools e2fsprogs parted libarchive-tools mtools python3
 ```
 
-Run `.ps1` scripts from PowerShell in the kit folder:
+**Where to keep the kit.** Use one copy, inside Linux (building on `/mnt/c` is very slow):
+
+```bash
+cd ~ && git clone https://github.com/jboptical/guacamole-linux-kit.git && cd guacamole-linux-kit
+```
+
+Run the `.sh` scripts there, from the kit folder:
+
+```bash
+bash scripts/<name>.sh
+```
+
+Windows reaches the same folder as `\\wsl.localhost\Ubuntu\home\<your user>\guacamole-linux-kit`. That way the `.ps1` scripts find the images the build wrote, and the backup lands next to the kit. Open PowerShell there and run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\<name>.ps1 ...
 ```
-
-Run `.sh` scripts in a Linux terminal, or in Ubuntu under WSL. On WSL, copy the kit into your WSL home first (`cp -r /mnt/c/.../guacamole-linux-kit ~`): building on `/mnt/c` is very slow.
 
 **Key combos**
 - **Fastboot:** with the phone off, hold Vol Up + Vol Down + Power.
@@ -243,6 +255,23 @@ On a headless install, only the services and `guac` are installed. To install th
 | `sensors/` | Sensor stack: hexagonrpcd patches, udev rules, registry import |
 | `guacamole-tools/` | Battery care, thermal limits, Panel, Server Monitor, `guac` |
 | `images/` | Build output of `build-uboot.sh` (not in git) |
+
+## Test status
+
+**In daily use on the author's phone** (12 GB/256 GB, OxygenOS 12 base):
+- The U-Boot image, the kernel with patches 0101–0105 and the firmware set.
+- Every individual setup script (`setup-qcom`, `personalize-dtb`, `setup-audio`, `setup-chrony`, `setup-sensors`, `setup-desktop-arch`, lightly adapted for the kit) and guacamole-tools. The author's install was done step by step with these scripts, from Arch Linux ARM with Plasma.
+
+**Tested off the phone:**
+- `install-arch.sh` (with `--partition`, `--gui` and `--headless`) and `partition-ufs.sh`, run in WSL against sparse 238 GB and 119 GB disks laid out like the phone's. This covered partitioning, the rootfs, kernel, boot entry, device tree and kit copy.
+
+**Not yet run on a fresh phone:**
+- The all-in-one `setup-arch.sh` and the new `setup-network.sh`. They run the scripts above in order, plus the internet-through-the-PC bootstrap.
+- `build-uboot.sh`'s DisplayPort DTB step.
+- The headless guacamole-tools install.
+- The 6 GB/128 GB and 8 GB/256 GB models.
+
+If you try any of these, please report how it went.
 
 ## Credits
 

@@ -2,7 +2,7 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <vendor>guacamole linux-kit</vendor>
+  <vendor>guacamole-linux-kit</vendor>
   <action id="org.guacamole.helper">
     <description>Change OnePlus 7 Pro charging, CPU, suspend, swap and brightness settings</description>
     <message>Guacamole wants to change charging, CPU, suspend, swap or brightness settings</message>

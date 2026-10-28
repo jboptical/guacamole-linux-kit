@@ -41,9 +41,10 @@ if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
   export all_proxy=$PROXY https_proxy=$PROXY http_proxy=$PROXY
   # pacman's own downloader ignores proxies: hand downloads to curl for now
   # (and no download sandbox, which may not let curl reach the proxy)
-  cp /etc/pacman.conf /etc/pacman.conf.guacamole-setup
+  # (removed again on exit; only these two lines, so later changes such as
+  # the IgnorePkg below stay)
   sed -i '/^\[options\]/a XferCommand = /usr/bin/curl --socks5-hostname 127.0.0.1:1080 -L -C - -f -o %o %u\nDisableSandbox' /etc/pacman.conf
-  trap 'mv -f /etc/pacman.conf.guacamole-setup /etc/pacman.conf' EXIT
+  trap "sed -i -e '\\|^XferCommand = /usr/bin/curl --socks5-hostname 127.0.0.1:1080 |d' -e '/^DisableSandbox\$/d' /etc/pacman.conf" EXIT
 fi
 export PROXY
 curl -fsI -m 10 http://os.archlinuxarm.org >/dev/null ||

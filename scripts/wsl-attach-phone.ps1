@@ -7,7 +7,7 @@
     winget install usbipd            # https://github.com/dorssel/usbipd-win
 
   Each time (phone showing the U-Boot menu -> "Enable USB mass storage"):
-    # ADMIN PowerShell, from the linux-kit folder
+    # ADMIN PowerShell, from the kit folder
     powershell -ExecutionPolicy Bypass -File .\scripts\wsl-attach-phone.ps1
     # when finished:
     powershell -ExecutionPolicy Bypass -File .\scripts\wsl-attach-phone.ps1 -Detach
