@@ -1,0 +1,47 @@
+#!/bin/sh
+# Populate the writable sensor registry served to the SLPI by hexagonrpcd.
+#
+# The sensor DSP keeps its registry (sensor placement, factory calibration,
+# runtime calibration) on the persist partition and rewrites parts of it at
+# every boot. hexagonrpcd serves /usr/share/qcom/sensors/registry, which this
+# package points at /var/lib/guacamole/sensors/registry. On first boot, copy
+# this unit's own factory registry from persist (read with debugfs, so the
+# partition is never mounted or written); fall back to the packaged snapshot
+# from the development phone if persist is unreadable.
+set -e
+
+dst=/var/lib/guacamole/sensors
+default=/usr/share/guacamole/sensors-registry-default
+persist=/dev/disk/by-partlabel/persist
+
+if [ ! -d "$dst/registry" ] || [ -z "$(ls -A "$dst/registry" 2>/dev/null)" ]; then
+	tmp=$(mktemp -d)
+	if debugfs -R "rdump /sensors/registry $tmp" "$persist" >/dev/null 2>&1 &&
+	   [ -n "$(ls -A "$tmp/registry/registry" 2>/dev/null)" ]; then
+		echo "guacamole-sensors-registry: importing the factory registry from persist"
+		mkdir -p "$dst"
+		cp -r "$tmp/registry/registry" "$dst/registry"
+		for f in sns_reg_version file1 file2; do
+			[ -f "$tmp/registry/$f" ] && cp "$tmp/registry/$f" "$dst/$f"
+		done
+	else
+		echo "guacamole-sensors-registry: persist unreadable, using the packaged default registry" >&2
+		mkdir -p "$dst"
+		cp -r "$default/registry" "$dst/registry"
+	fi
+	rm -rf "$tmp"
+fi
+
+# The DSP rewrites these; hexagonrpcd cannot create files, only open existing ones.
+for f in sns_reg_version file1 file2; do
+	[ -f "$dst/$f" ] || : > "$dst/$f"
+done
+
+# The DSP picks its sensor configuration by the OnePlus project number, which
+# the bootloader passes on the kernel command line (18821 on the 7 Pro).
+prj=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^androidboot.project_name=//p' | head -1)
+mkdir -p "$dst/project_info"
+printf '%s' "${prj:-18821}" > "$dst/project_info/project_name"
+
+chown -R fastrpc:fastrpc "$dst"
+chmod -R u+rwX,go+rX "$dst"

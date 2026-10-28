@@ -1,0 +1,24 @@
+#!/bin/sh
+# Mark the active A/B boot slot as successfully booted, like Android's
+# boot_control HAL / qbootctl -m. Qualcomm GPT attribute bits on boot_a/boot_b:
+#   48-49 priority, 50 active, 51-53 retry count, 54 successful, 55 unbootable
+for i in $(seq 1 20); do [ -e /dev/disk/by-partlabel/boot_a ] && break; sleep 1; done
+for s in a b; do
+  dev=$(readlink -f /dev/disk/by-partlabel/boot_$s 2>/dev/null) || continue
+  [ -b "$dev" ] || continue
+  name=$(basename "$dev")
+  disk=/dev/$(basename "$(dirname "$(readlink -f /sys/class/block/$name)")")
+  num=$(cat /sys/class/block/$name/partition)
+  attrs=$(sfdisk --part-attrs "$disk" "$num" 2>/dev/null)
+  bits=$(echo "$attrs" | tr ' ' '\n' | sed -n 's/^GUID://p' | tr ',' ' ')
+  other=$(echo "$attrs" | tr ' ' '\n' | grep -v '^GUID:' | tr '\n' ' ')
+  case " $bits " in *" 50 "*) ;; *) continue ;; esac      # only the active slot
+  case " $bits " in *" 54 "*) case " $bits " in *" 55 "*) ;; *) exit 0 ;; esac ;; esac
+  new=""
+  for b in $bits 54; do
+    [ "$b" = 55 ] && continue
+    case ",$new," in *",$b,"*) ;; *) new="${new:+$new,}$b" ;; esac
+  done
+  sfdisk --no-reread --no-tell-kernel --part-attrs "$disk" "$num" "${other}GUID:$new" \
+    && echo "boot_$s ($disk part $num) marked successful: GUID:$new"
+done

@@ -1,0 +1,74 @@
+#!/bin/sh
+# guacamole-thermal: lower the kernel's thermal throttling points. The mainline
+# SM8150 device tree throttles the CPUs only from 90 °C (and harder from 95 °C)
+# and the GPU from 85 °C; for a phone SoC in a sealed glass case, running as a
+# server next to a battery, that is too hot. The trip temperatures are writable
+# in sysfs, so this sets them at every boot (guacamole-thermal.service).
+# The critical trips (110 °C emergency shutdown) are never touched.
+#
+#   guacamole-thermal apply      set the trips from /etc/guacamole/thermal.conf
+#   guacamole-thermal status     show the CPU/GPU trips now
+#
+# /etc/guacamole/thermal.conf (°C): CPU_TRIP=80  CPU_TRIP2=85  GPU_TRIP=80
+set -eu
+CONF=/etc/guacamole/thermal.conf
+CPU_TRIP=80
+CPU_TRIP2=85
+GPU_TRIP=80
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+zones() {
+  for z in /sys/class/thermal/thermal_zone*; do
+    case "$(cat "$z/type")" in
+      cpu*-thermal) echo "cpu $z" ;;          # cpu0..3-thermal, cpu4..7-top/bottom-thermal
+      gpu*-thermal) echo "gpu $z" ;;
+    esac
+  done
+}
+
+status() {
+  zones | while read -r kind z; do
+    printf "%-22s" "$(cat "$z/type")"
+    for tp in "$z"/trip_point_*_type; do
+      n=${tp%_type}
+      printf " %s %s°C" "$(cat "$tp")" "$(( $(cat "${n}_temp") / 1000 ))"
+    done
+    echo
+  done
+}
+
+apply() {
+  # the thermal zones come with the tsens driver: wait for them after boot
+  i=0
+  while ! grep -qx "cpu0-thermal" /sys/class/thermal/thermal_zone*/type 2>/dev/null; do
+    i=$((i + 1)); [ $i -gt 60 ] && { echo "no cpu0-thermal zone after 30 s" >&2; exit 1; }
+    sleep 0.5
+  done
+  for v in "$CPU_TRIP" "$CPU_TRIP2" "$GPU_TRIP"; do
+    case "$v" in ''|*[!0-9]*) echo "not a temperature: $v" >&2; exit 2 ;; esac
+    [ "$v" -ge 50 ] && [ "$v" -le 100 ] || { echo "$v °C is outside 50-100" >&2; exit 2; }
+  done
+  [ "$CPU_TRIP2" -ge "$CPU_TRIP" ] || { echo "CPU_TRIP2 must not be below CPU_TRIP" >&2; exit 2; }
+  zones | while read -r kind z; do
+    nth=0
+    for tp in "$z"/trip_point_*_type; do
+      [ "$(cat "$tp")" = passive ] || continue
+      nth=$((nth + 1))
+      if [ "$kind" = cpu ]; then
+        [ $nth = 1 ] && want=$CPU_TRIP || want=$CPU_TRIP2
+      else
+        [ $nth = 1 ] || continue
+        want=$GPU_TRIP
+      fi
+      echo $((want * 1000)) > "${tp%_type}_temp"
+    done
+  done
+  echo "throttling from: CPUs ${CPU_TRIP} °C (harder from ${CPU_TRIP2} °C), GPU ${GPU_TRIP} °C"
+}
+
+case "${1:-status}" in
+  apply) apply ;;
+  status) status ;;
+  *) echo "usage: guacamole-thermal apply|status" >&2; exit 2 ;;
+esac

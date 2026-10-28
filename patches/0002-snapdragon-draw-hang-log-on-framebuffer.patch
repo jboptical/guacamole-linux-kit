@@ -1,0 +1,205 @@
+diff --git a/arch/arm/mach-snapdragon/Makefile b/arch/arm/mach-snapdragon/Makefile
+index 2360b7c6..3b708276 100644
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -13,3 +13,4 @@ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ endif
+ 
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o
++obj-y += guac_diag.o
+diff --git a/arch/arm/mach-snapdragon/guac_diag.c b/arch/arm/mach-snapdragon/guac_diag.c
+new file mode 100644
+index 00000000..985117d4
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/guac_diag.c
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * OnePlus 7 Pro (guacamole) bring-up diagnostics: draw progress bands and,
++ * on hang(), the console log as text straight into the ABL framebuffer.
++ */
++#include <cpu_func.h>
++#include <asm/global_data.h>
++#include <membuf.h>
++#include <video_font_data.h>
++#include <video_font_ter16x32.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define FB_BASE		0x9c000000UL
++#define FB_W		1440UL
++#define FB_H		3120UL
++#define FB_STRIDE	(FB_W * 4)
++#define FW		16
++#define FH		32
++
++const char *guac_fail_func __section(".data") = NULL;
++const char *guac_fail_call __section(".data") = NULL;
++
++static void fb_flush(ulong start, ulong end)
++{
++	if (dcache_status())
++		flush_dcache_range(start & ~63UL, (end + 63) & ~63UL);
++}
++
++static void fb_fill(ulong y0, ulong rows, u32 color)
++{
++	ulong start = FB_BASE + y0 * FB_STRIDE, end = start + rows * FB_STRIDE, p;
++
++	for (p = start; p < end; p += 4)
++		*(volatile u32 *)p = color;
++	fb_flush(start, end);
++}
++
++void guac_canary(int band, u32 color)
++{
++	fb_fill((FB_H / 8) * band, FB_H / 8, color);
++}
++
++static void fb_char(ulong x, ulong y, int scale, unsigned char c, u32 fg)
++{
++	const unsigned char *g = video_fontdata_16x32 + (ulong)c * (FW * FH / 8);
++	int r, b, sy, sx;
++
++	if (x + FW * scale > FB_W || y + FH * scale > FB_H)
++		return;
++	for (r = 0; r < FH; r++) {
++		u16 bits = (g[r * 2] << 8) | g[r * 2 + 1];
++
++		for (sy = 0; sy < scale; sy++) {
++			volatile u32 *row = (u32 *)(FB_BASE + (y + r * scale + sy) * FB_STRIDE) + x;
++
++			for (b = 0; b < FW; b++)
++				for (sx = 0; sx < scale; sx++)
++					row[b * scale + sx] = (bits & (0x8000 >> b)) ? fg : 0;
++		}
++	}
++}
++
++static ulong fb_str(ulong y, int scale, const char *s, u32 fg)
++{
++	ulong x = 0, cols = FB_W / (FW * scale);
++
++	for (; s && *s; s++) {
++		if (*s == '\n' || x >= cols) {
++			x = 0;
++			y += FH * scale;
++			if (*s == '\n')
++				continue;
++		}
++		fb_char(x * FW * scale, y, scale, *s, fg);
++		x++;
++	}
++	return y + FH * scale;
++}
++
++/* iterate a circular membuf from tail to head */
++static int mb_next(struct membuf *mb, char **p)
++{
++	char c;
++
++	if (*p == mb->head)
++		return -1;
++	c = **p;
++	(*p)++;
++	if (*p >= mb->end)
++		*p = mb->start;
++	return (unsigned char)c;
++}
++
++void guac_dump(void)
++{
++	struct membuf *mb = &gd->console_out;
++	ulong y = (FB_H / 8) * 2, ymax = (FB_H / 8) * 7;
++	int maxlines = (ymax - y) / FH - 3, lines = 0, skip, c, col = 0;
++	ulong cols = FB_W / FW;
++	char *p;
++	char line[FB_W / FW + 1];
++	int n = 0;
++
++	fb_fill(y, ymax - y, 0);
++	if (guac_fail_call) {
++		y = fb_str(y, 2, "FAILED:", 0x00ff4040);
++		y = fb_str(y, 2, guac_fail_call, 0x00ff4040);
++		y = fb_str(y, 1, guac_fail_func, 0x00ffff00);
++		maxlines -= 4;
++	}
++	if (!mb->start || mb->head == mb->tail) {
++		fb_str(y, 2, "(no console record)", 0x00ffffff);
++		fb_flush(FB_BASE, FB_BASE + FB_H * FB_STRIDE);
++		return;
++	}
++	/* count wrapped lines */
++	p = mb->tail;
++	while ((c = mb_next(mb, &p)) >= 0) {
++		if (c == '\n' || ++col >= cols) {
++			lines++;
++			col = 0;
++		}
++	}
++	skip = lines > maxlines ? lines - maxlines : 0;
++	p = mb->tail;
++	lines = 0;
++	col = 0;
++	while ((c = mb_next(mb, &p)) >= 0) {
++		int eol = (c == '\n');
++
++		if (!eol && c >= 32 && c < 127)
++			line[n++] = c;
++		if (eol || n >= cols) {
++			line[n] = 0;
++			if (lines >= skip)
++				y = fb_str(y, 1, line, 0x00ffffff);
++			lines++;
++			n = 0;
++		}
++	}
++	if (n) {
++		line[n] = 0;
++		fb_str(y, 1, line, 0x00ffffff);
++	}
++	fb_flush(FB_BASE, FB_BASE + FB_H * FB_STRIDE);
++}
+diff --git a/include/initcall.h b/include/initcall.h
+index 220a55ad..b9056919 100644
+--- a/include/initcall.h
++++ b/include/initcall.h
+@@ -12,9 +12,12 @@
+ 
+ _Static_assert(EVT_COUNT < 256, "Can only support 256 event types with 8 bits");
+ 
++extern const char *guac_fail_func, *guac_fail_call;
+ #define INITCALL(_call) \
+ 	do { \
+ 		if (_call()) { \
++			guac_fail_func = __func__; \
++			guac_fail_call = #_call; \
+ 			printf("%s(): initcall %s() failed\n", __func__, \
+ 			       #_call); \
+ 			hang(); \
+@@ -24,6 +27,8 @@ _Static_assert(EVT_COUNT < 256, "Can only support 256 event types with 8 bits");
+ #define INITCALL_EVT(_evt) \
+ 	do { \
+ 		if (event_notify_null(_evt)) { \
++			guac_fail_func = __func__; \
++			guac_fail_call = "event " #_evt; \
+ 			printf("%s(): event %d/%s failed\n", __func__, _evt, \
+ 			       event_type_name(_evt)) ; \
+ 			hang(); \
+diff --git a/lib/hang.c b/lib/hang.c
+index f3c3c896..a42f8bbe 100644
+--- a/lib/hang.c
++++ b/lib/hang.c
+@@ -20,8 +20,12 @@
+  * the user one needs to catch the bootstage_error (see show_boot_progress())
+  * in the board code.
+  */
++void guac_canary(int band, unsigned int color);
++void guac_dump(void);
+ void hang(void)
+ {
++	guac_canary(7, 0x00ff00ff);	/* MAGENTA (bottom): panic / hang */
++	guac_dump();
+ #if !defined(CONFIG_XPL_BUILD) || \
+ 		(CONFIG_IS_ENABLED(LIBCOMMON_SUPPORT) && \
+ 		 CONFIG_IS_ENABLED(SERIAL))

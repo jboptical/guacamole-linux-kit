@@ -1,0 +1,11 @@
+[Unit]
+Description=Guacamole thermal: throttle CPU/GPU from 80 °C instead of 90 °C
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/guacamole-thermal apply
+
+[Install]
+WantedBy=multi-user.target

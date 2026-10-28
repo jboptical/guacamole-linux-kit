@@ -1,0 +1,20 @@
+# build output and downloads
+build/
+images/*
+!images/.gitkeep
+*.tar.gz
+*.tar.zst
+*.zip
+
+# private: partition backups (IMEI, calibration), GPT backups, slot notes
+guacamole-backup-*/
+backup-*/
+*.img
+*.sgdisk
+android-slot.txt
+
+# editor / OS clutter
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

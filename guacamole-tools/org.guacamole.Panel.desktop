@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Guacamole Panel
+GenericName=Phone status and battery care
+Comment=OnePlus 7 Pro battery, charging limit, temperatures, CPU, DSPs, Wi-Fi and USB-C
+Exec=guacamole-panel
+Icon=phone
+Terminal=false
+Categories=Settings;System;HardwareSettings;
+Keywords=battery;charge;limit;thermal;temperature;cpu;oneplus;
+StartupNotify=true
+X-KDE-FormFactor=desktop;tablet;handset;
+X-Purism-FormFactor=Workstation;Mobile;

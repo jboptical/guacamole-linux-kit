@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Guacamole Server Monitor: a full-screen status page for the OnePlus 7 Pro
+when it runs as a server (keep awake / no-suspend on).
+
+Starts at login in server mode (autostart with --autostart, which quits at
+once when server mode is off); "Desktop" closes it and leaves the Plasma
+desktop; "Screen on" keeps the screen from turning off while it is open.
+Same data as Guacamole Panel and guac, through guacamole_common.
+Dark only (AMOLED), and the content drifts a few pixels every minute so a
+static page does not burn into the panel.
+"""
+import os
+import subprocess
+import sys
+import threading
+
+sys.path[:0] = [os.path.dirname(os.path.realpath(__file__)), "/usr/local/lib/guacamole"]
+import guacamole_common as gc  # noqa: E402
+
+import gi  # noqa: E402
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.guacamole.Monitor"
+REFRESH_S = 2
+DRIFT = ((0, 0), (6, 4), (12, 8), (6, 12), (0, 8), (-6, 4))   # px, one step a minute
+
+CSS = b"""
+.card-title { font-size: 0.85em; font-weight: bold; letter-spacing: 0.08em; opacity: 0.6; }
+.big { font-size: 2.6em; font-weight: 300; }
+.huge { font-size: 3.2em; font-weight: 200; }
+.ok { color: #57e389; }
+.warn { color: #f8e45c; }
+.bad { color: #ff7b63; }
+.detail { opacity: 0.75; }
+"""
+
+
+class Card(Gtk.Box):
+    def __init__(self, title, value_class="big"):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.add_css_class("card")
+        for side in ("start", "end", "top", "bottom"):
+            getattr(self, "set_margin_" + side)(4)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                        margin_start=16, margin_end=16, margin_top=14, margin_bottom=14)
+        self.append(inner)
+        t = Gtk.Label(label=title.upper(), xalign=0)
+        t.add_css_class("card-title")
+        inner.append(t)
+        self.value = Gtk.Label(xalign=0, wrap=True)
+        self.value.add_css_class(value_class)
+        inner.append(self.value)
+        self.bar = Gtk.LevelBar(min_value=0, max_value=1, visible=False)
+        inner.append(self.bar)
+        self.details = Gtk.Label(xalign=0, wrap=True, justify=Gtk.Justification.LEFT)
+        self.details.add_css_class("detail")
+        inner.append(self.details)
+        # card actions (gc.CARD_ACTIONS): a row of buttons, rebuilt when the list changes
+        self.actions = None
+        self.on_action = None              # set by the window: fn(button, card, name)
+        self.buttons = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=8, row_spacing=8,
+                                   margin_top=6, visible=False)
+        inner.append(self.buttons)
+        self.msg = Gtk.Label(xalign=0, wrap=True, visible=False)
+        self.msg.add_css_class("detail")
+        inner.append(self.msg)
+        self._state = None
+
+    def set_actions(self, names):
+        names = list(names or [])
+        if names == self.actions:
+            return
+        self.actions = names
+        while (child := self.buttons.get_first_child()) is not None:
+            self.buttons.remove(child)
+        for name in names:
+            b = Gtk.Button(label=gc.CARD_ACTIONS[name][0], halign=Gtk.Align.START)
+            b.add_css_class("pill")
+            b.add_css_class("destructive-action")
+            b.connect("clicked", lambda btn, n=name: self.on_action(btn, self, n))
+            self.buttons.append(b)
+        self.buttons.set_visible(bool(names))
+
+    def set(self, value, details="", fraction=None, state=None):
+        if self.value.get_label() != value:
+            self.value.set_label(value)
+        if self.details.get_label() != details:
+            self.details.set_label(details)
+        self.bar.set_visible(fraction is not None)
+        if fraction is not None:
+            self.bar.set_value(max(0.0, min(1.0, fraction)))
+        if state != self._state:
+            for c in ("ok", "warn", "bad"):
+                self.value.remove_css_class(c)
+            if state:
+                self.value.add_css_class(state)
+            self._state = state
+
+
+class Monitor(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Server Monitor")
+        self.set_default_size(480, 1040)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.drift_box = outer
+        head = Gtk.Box(spacing=12, margin_start=20, margin_end=20, margin_top=16, margin_bottom=4)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.clock = Gtk.Label(xalign=0)
+        self.clock.add_css_class("huge")
+        # wraps instead of widening the header (hostname · uptime · date)
+        self.host = Gtk.Label(xalign=0, wrap=True, wrap_mode=2)
+        self.host.add_css_class("detail")
+        titles.append(self.clock)
+        titles.append(self.host)
+        head.append(titles)
+        # buttons stacked, so the header fits a 480 px wide phone screen
+        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER)
+        self.inhibit_cookie = None
+        screen = Gtk.ToggleButton(label="Screen: auto")
+        screen.add_css_class("pill")
+        screen.set_tooltip_text("Keep the screen on while this monitor is open "
+                                "(auto: it turns off after %d s idle)" % gc.SERVER_SCREEN_OFF_S)
+        screen.connect("toggled", self.on_screen_on)
+        buttons.append(screen)
+        desk = Gtk.Button(label="Desktop")
+        desk.add_css_class("pill")
+        desk.add_css_class("suggested-action")
+        desk.set_tooltip_text("Close the monitor and go to the desktop")
+        desk.connect("clicked", lambda *_: app.quit())
+        buttons.append(desk)
+        head.append(buttons)
+        outer.append(head)
+
+        self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False,
+                                min_children_per_line=1, max_children_per_line=4,
+                                column_spacing=4, row_spacing=4,
+                                margin_start=12, margin_end=12, margin_top=8, margin_bottom=12)
+        self.cards = {}
+        for key, title in gc.MONITOR_CARDS:
+            c = Card(title)
+            c.set_size_request(300, -1)
+            c.on_action = self.on_card_action
+            self.flow.append(c)
+            self.cards[key] = c
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_child(self.flow)
+        outer.append(scroll)
+        if os.environ.get("GUAC_SCROLL") == "end":      # test hook: screenshot the last cards
+            adj = scroll.get_vadjustment()
+            adj.connect("changed", lambda a: a.set_value(a.get_upper() - a.get_page_size()))
+        self.set_content(outer)
+
+        self.prev_net = None
+        self.drift_i = 0
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_S, self.refresh)
+        GLib.timeout_add_seconds(60, self.drift)
+        self.fullscreen()
+
+    def drift(self):
+        self.drift_i = (self.drift_i + 1) % len(DRIFT)
+        dx, dy = DRIFT[self.drift_i]
+        self.drift_box.set_margin_start(max(0, dx))
+        self.drift_box.set_margin_end(max(0, -dx))
+        self.drift_box.set_margin_top(dy)
+        return True
+
+    def refresh(self):
+        try:
+            self.update()
+        except Exception as e:  # never let one bad read kill the timer
+            print("refresh:", repr(e))
+        return True
+
+    def update(self):
+        head, cards, self.prev_net = gc.monitor_cards(self.prev_net)
+        self.clock.set_label(head["clock"])
+        self.host.set_label("%s  ·  up %s\n%s" % (head["host"], head["uptime"], head["date"]))
+        for key, c in self.cards.items():
+            d = cards.get(key)
+            # FlowBox wraps each card in a FlowBoxChild: hide that, or a gap stays
+            c.get_parent().set_visible(d is not None)
+            if d:
+                c.set(d["value"], d["details"], fraction=d["fraction"], state=d["state"])
+                c.set_actions(d.get("actions"))
+
+    def on_card_action(self, button, card, name):
+        label, question = gc.CARD_ACTIONS[name]
+        dlg = Adw.AlertDialog(heading=label + "?", body=question)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("go", label)
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def chosen(d, response):
+            if response != "go":
+                return
+            button.set_sensitive(False)
+            card.msg.set_label(label + "...")
+            card.msg.set_visible(True)
+
+            def work():
+                # sudo -n for the desktop user, else pkexec asks on screen
+                try:
+                    p = subprocess.run(gc.helper_cmd(["troubleshoot", name]),
+                                       capture_output=True, text=True, timeout=600)
+                    out = (p.stdout or p.stderr).strip().splitlines()
+                    text = out[-1] if out else ("done" if p.returncode == 0 else "failed")
+                except (OSError, subprocess.SubprocessError) as e:
+                    text = "failed: %s" % e
+                GLib.idle_add(done, text)
+
+            def done(text):
+                card.msg.set_label(text)
+                button.set_sensitive(True)
+                self.refresh()
+                return False
+
+            threading.Thread(target=work, daemon=True).start()
+
+        dlg.connect("response", chosen)
+        dlg.present(self)
+
+    def on_screen_on(self, button):
+        # an idle inhibitor keeps powerdevil from turning the screen off while
+        # someone watches the stats; released again when the toggle goes off
+        app = self.get_application()
+        if button.get_active() and self.inhibit_cookie is None:
+            self.inhibit_cookie = app.inhibit(self, Gtk.ApplicationInhibitFlags.IDLE,
+                                              "Server Monitor: keeping the screen on")
+        elif not button.get_active() and self.inhibit_cookie is not None:
+            app.uninhibit(self.inhibit_cookie)
+            self.inhibit_cookie = None
+        button.set_label("Screen: on" if button.get_active() else "Screen: auto")
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.props.active_window or Monitor(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    if "--autostart" in sys.argv[1:]:
+        # login autostart: only in server mode
+        if gc.no_suspend() != "on":
+            sys.exit(0)
+        sys.argv.remove("--autostart")
+    App().run(None)

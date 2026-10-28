@@ -1,0 +1,88 @@
+#!/bin/sh
+# Root helper for Guacamole Panel and the guac CLI (run through pkexec or
+# sudo). Only these fixed, validated actions are possible:
+#   guacamole-helper charge MAX RESUME DEEP_MIN DEEP_EVERY_DAYS
+#   guacamole-helper full-once | deep-now
+#   guacamole-helper governor NAME
+#   guacamole-helper nosuspend on|off
+#   guacamole-helper brightness VALUE      (raw, 1..max_brightness)
+#   guacamole-helper swap off|1|2|4|8      (swap file size in GB)
+set -eu
+CONF=/etc/guacamole/chgctrl.conf
+STATE=/var/lib/guacamole
+SLEEP_TARGETS="sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+isnum() { case "$1" in ''|*[!0-9]*) return 1 ;; *) [ "$1" -le 1000 ] ;; esac; }
+reload() { systemctl reload guacamole-chgctrl 2>/dev/null || systemctl restart guacamole-chgctrl; }
+
+case "${1:-}" in
+charge)
+  [ $# -eq 5 ] || { echo "usage: charge MAX RESUME DEEP_MIN DEEP_EVERY_DAYS" >&2; exit 2; }
+  for v in "$2" "$3" "$4" "$5"; do isnum "$v" || { echo "not a number: $v" >&2; exit 2; }; done
+  [ "$2" -ge 50 ] && [ "$2" -le 100 ] || { echo "MAX must be 50-100" >&2; exit 2; }
+  [ "$3" -ge 20 ] && [ "$3" -le "$2" ] || { echo "RESUME must be 20-MAX" >&2; exit 2; }
+  [ "$4" -ge 10 ] && [ "$4" -le "$3" ] || { echo "DEEP_MIN must be 10-RESUME" >&2; exit 2; }
+  [ "$5" -le 365 ] || { echo "DEEP_EVERY_DAYS must be 0-365" >&2; exit 2; }
+  mkdir -p /etc/guacamole
+  [ -f "$CONF" ] || printf 'CHG_MAX=80\nCHG_RESUME=75\nDEEP_MIN=60\nDEEP_EVERY_DAYS=7\nCHG_SDP_UA=0\n' > "$CONF"
+  for kv in "CHG_MAX=$2" "CHG_RESUME=$3" "DEEP_MIN=$4" "DEEP_EVERY_DAYS=$5"; do
+    k=${kv%%=*}
+    if grep -q "^$k=" "$CONF"; then sed -i "s/^$k=.*/$kv/" "$CONF"; else echo "$kv" >> "$CONF"; fi
+  done
+  reload ;;
+full-once|deep-now)
+  mkdir -p "$STATE"; touch "$STATE/$1"; reload ;;
+governor)
+  [ $# -eq 2 ] || { echo "usage: governor NAME" >&2; exit 2; }
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    grep -qw -- "$2" "$p/scaling_available_governors" || { echo "governor $2 not available" >&2; exit 2; }
+  done
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$2" > "$p/scaling_governor"; done ;;
+nosuspend)
+  # masking the sleep targets blocks suspend from every source (desktop idle
+  # timer, power menu, logind) and survives reboots; logind then reports
+  # CanSuspend=na so desktops hide the option
+  [ $# -eq 2 ] || { echo "usage: nosuspend on|off" >&2; exit 2; }
+  case "$2" in
+  on)  systemctl mask $SLEEP_TARGETS ;;
+  off) systemctl unmask $SLEEP_TARGETS ;;
+  *)   echo "usage: nosuspend on|off" >&2; exit 2 ;;
+  esac ;;
+brightness)
+  [ $# -eq 2 ] || { echo "usage: brightness VALUE" >&2; exit 2; }
+  case "$2" in ''|*[!0-9]*) echo "not a number: $2" >&2; exit 2 ;; esac
+  for b in /sys/class/backlight/*; do
+    [ -e "$b/brightness" ] || continue
+    [ "$2" -ge 1 ] && [ "$2" -le "$(cat "$b/max_brightness")" ] ||
+      { echo "brightness must be 1-$(cat "$b/max_brightness")" >&2; exit 2; }
+    echo "$2" > "$b/brightness"; exit 0
+  done
+  echo "no backlight found" >&2; exit 1 ;;
+swap)
+  # /swapfile on the root filesystem, listed in /etc/fstab; swappiness 10 so
+  # the UFS only sees swap writes under real memory pressure
+  [ $# -eq 2 ] || { echo "usage: swap off|1|2|4|8" >&2; exit 2; }
+  case "$2" in off|1|2|4|8) ;; *) echo "swap size must be off, 1, 2, 4 or 8 (GB)" >&2; exit 2 ;; esac
+  SF=/swapfile
+  if [ "$2" != off ]; then
+    have=$(( $(stat -c %s "$SF" 2>/dev/null || echo 0) / 1073741824 ))
+    free=$(( $(df --output=avail -B1 / | tail -1) / 1073741824 + have ))
+    [ "$free" -ge $(( $2 + 5 )) ] || { echo "not enough free space for $2 GB of swap (keeps 5 GB free)" >&2; exit 1; }
+  fi
+  if grep -q "^$SF " /proc/swaps; then swapoff "$SF"; fi
+  rm -f "$SF"
+  sed -i "\|^$SF[[:space:]]|d" /etc/fstab
+  if [ "$2" = off ]; then
+    rm -f /etc/sysctl.d/90-guacamole-swap.conf
+    sysctl -q vm.swappiness=60
+    exit 0
+  fi
+  fallocate -l "${2}G" "$SF"
+  chmod 600 "$SF"
+  mkswap -q "$SF"
+  swapon "$SF"
+  echo "$SF none swap defaults 0 0" >> /etc/fstab
+  echo "vm.swappiness = 10" > /etc/sysctl.d/90-guacamole-swap.conf
+  sysctl -q vm.swappiness=10 ;;
+*)
+  echo "unknown action: ${1:-}" >&2; exit 2 ;;
+esac

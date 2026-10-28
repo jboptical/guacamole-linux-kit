@@ -1,0 +1,90 @@
+From: guacamole linux-kit
+Subject: [PATCH] drm/msm/dpu: turn off bootloader autorefresh before the SMMU attach
+
+On the OnePlus 7 Pro (SM8150, DPU 5.0, Samsung command-mode DSC panel) the
+bootloader leaves INTF autorefresh on so the splash keeps refreshing. When
+the DSI host powers up during the first modeset, autorefresh starts frames
+that fetch the splash from 0x9c000000, but the SMMU is already attached
+(_dpu_kms_mmu_init), so every boot logs 10 "Unhandled context fault"
+(SIDs 0x800/0xc20, iova 0x9c...) and some boots hang with a dark panel
+before userspace. dpu_encoder_phys_cmd_enable_te() does turn autorefresh
+off, but only when the encoder is first enabled.
+
+Clear the autorefresh enable bit on every DSI INTF (DPU 5+) or pingpong
+(older) in dpu_kms_hw_init(), before the SMMU is attached, and log the
+value found so the bootloader state is visible in dmesg.
+---
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -1106,6 +1106,62 @@
+ 	dpu_kms->base.vm = NULL;
+ }
+ 
++/*
++ * The bootloader leaves a command-mode panel refreshing its splash with
++ * autorefresh on, so the DPU keeps fetching the splash from its physical
++ * address. Once _dpu_kms_mmu_init() attaches the SMMU those fetches fault,
++ * and on the OnePlus 7 Pro boots sometimes hang right there. The encoder only
++ * turns autorefresh off when it is first enabled, which is too late, so turn
++ * it off on every DSI interface (DPU 5+) or pingpong (older DPUs) before the
++ * SMMU is attached. A command-mode panel keeps showing its last frame.
++ */
++#define DPU_INTF_TEAR_AUTOREFRESH_CONFIG	0x2b4
++#define DPU_PP_AUTOREFRESH_CONFIG		0x030
++
++static void _dpu_kms_disable_boot_autorefresh(struct dpu_kms *dpu_kms)
++{
++	const struct dpu_mdss_cfg *cat = dpu_kms->catalog;
++	struct device *dev = &dpu_kms->pdev->dev;
++	void __iomem *reg;
++	bool was_on = false;
++	u32 val;
++	int i;
++
++	if (cat->mdss_ver->core_major_ver >= 5) {
++		for (i = 0; i < cat->intf_count; i++) {
++			if (cat->intf[i].type != INTF_DSI)
++				continue;
++			reg = dpu_kms->mmio + cat->intf[i].base +
++			      DPU_INTF_TEAR_AUTOREFRESH_CONFIG;
++			val = readl_relaxed(reg);
++			if (!(val & BIT(31)))
++				continue;
++			writel_relaxed(val & ~BIT(31), reg);
++			was_on = true;
++			dev_info(dev, "intf_%d: bootloader autorefresh (0x%08x) turned off\n",
++				 cat->intf[i].id - INTF_0, val);
++		}
++	} else {
++		for (i = 0; i < cat->pingpong_count; i++) {
++			reg = dpu_kms->mmio + cat->pingpong[i].base +
++			      DPU_PP_AUTOREFRESH_CONFIG;
++			val = readl_relaxed(reg);
++			if (!(val & BIT(31)))
++				continue;
++			writel_relaxed(val & ~BIT(31), reg);
++			was_on = true;
++			dev_info(dev, "pingpong_%d: bootloader autorefresh (0x%08x) turned off\n",
++				 cat->pingpong[i].id - PINGPONG_0, val);
++		}
++	}
++
++	/* let a frame that is already being fetched finish (one frame at 60 Hz) */
++	if (was_on) {
++		wmb();
++		msleep(20);
++	}
++}
++
+ static int _dpu_kms_mmu_init(struct dpu_kms *dpu_kms)
+ {
+ 	struct drm_gpuvm *vm;
+@@ -1179,6 +1235,8 @@
+ 		goto err_pm_put;
+ 	}
+ 
++	_dpu_kms_disable_boot_autorefresh(dpu_kms);
++
+ 	/*
+ 	 * Now we need to read the HW catalog and initialize resources such as
+ 	 * clocks, regulators, GDSC/MMAGIC, ioremap the register ranges etc

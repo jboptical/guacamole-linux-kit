@@ -1,0 +1,75 @@
+From: guacamole linux-kit
+Subject: [PATCH] drm/msm/dp: check link bandwidth against the real pixel clock
+
+With wide bus the controller pixel clock is halved, and mode_valid used the
+halved clock for the link bandwidth check too, so modes needing up to twice
+the link capacity were accepted. On a 2-lane alt mode dock a 3440x1440
+monitor then got modes the link cannot carry: setting one gave a blank
+monitor, vblank / frame done timeouts and a hard hang. Use the real pixel
+rate for the link check (as upstream later does), and do not accept modes
+that would only fit at 6 bits per colour.
+---
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -926,9 +926,11 @@
+ 	const u32 num_components = 3, default_bpp = 24;
+ 	struct msm_dp_display_private *msm_dp_display;
+ 	struct msm_dp_link_info *link_info;
+-	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
++	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0, edid_bpp;
+ 	struct msm_dp *dp;
+ 	int mode_pclk_khz = mode->clock;
++	int link_pclk_khz;
++	bool is_yuv_420;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+ 
+@@ -940,22 +942,40 @@
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 	link_info = &msm_dp_display->panel->link_info;
+ 
+-	if ((drm_mode_is_420_only(&dp->connector->display_info, mode) &&
+-	     msm_dp_display->panel->vsc_sdp_supported) ||
+-	     msm_dp_wide_bus_available(dp))
++	is_yuv_420 = drm_mode_is_420_only(&dp->connector->display_info, mode) &&
++		     msm_dp_display->panel->vsc_sdp_supported;
++
++	/*
++	 * Wide bus halves the controller's pixel clock (two pixels per clock),
++	 * but the link still has to carry every pixel: only YUV 4:2:0 reduces
++	 * the link data rate. Check the link against the real pixel rate, or
++	 * modes up to twice the link capacity are offered and the pipeline
++	 * stalls (vblank timeouts, then a hard hang) when one is set.
++	 */
++	link_pclk_khz = is_yuv_420 ? mode_pclk_khz / 2 : mode_pclk_khz;
++
++	if (is_yuv_420 || msm_dp_wide_bus_available(dp))
+ 		mode_pclk_khz /= 2;
+ 
+ 	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
+ 		return MODE_CLOCK_HIGH;
+ 
+-	mode_bpp = dp->connector->display_info.bpc * num_components;
+-	if (!mode_bpp)
+-		mode_bpp = default_bpp;
++	edid_bpp = dp->connector->display_info.bpc * num_components;
++	if (!edid_bpp)
++		edid_bpp = default_bpp;
+ 
+ 	mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
+-			mode_bpp, mode_pclk_khz);
++			edid_bpp, link_pclk_khz);
++
++	/*
++	 * Do not offer modes that only fit the link by dropping below 8 bits
++	 * per colour: on the OnePlus 7 Pro such a mode (3440x1440@85 over a
++	 * 2-lane dock link) stalled the display pipeline and hung the phone.
++	 */
++	if (mode_bpp < min_t(u32, edid_bpp, default_bpp))
++		return MODE_CLOCK_HIGH;
+ 
+-	mode_rate_khz = mode_pclk_khz * mode_bpp;
++	mode_rate_khz = link_pclk_khz * mode_bpp;
+ 	supported_rate_khz = link_info->num_lanes * link_info->rate * 8;
+ 
+ 	if (mode_rate_khz > supported_rate_khz)

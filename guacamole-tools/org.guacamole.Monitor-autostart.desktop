@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Server Monitor (server mode)
+Comment=Opens the full-screen Server Monitor at login when keep awake (server mode) is on
+Exec=guacamole-monitor --autostart
+Icon=utilities-system-monitor
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-phase=2

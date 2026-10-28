@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Guacamole Panel: monitoring and control for the OnePlus 7 Pro (mainline).
+
+GTK 4 + libadwaita, runs on any desktop (Plasma, GNOME, Phosh), adapts to the
+phone screen and to a docked monitor. Reads sysfs directly (through
+guacamole_common, shared with the guac CLI); changes that need root go through
+pkexec /usr/local/libexec/guacamole-helper (a fixed, validated set of
+actions); brightness goes through systemd-logind (no root needed).
+
+Pages: Battery (gauge, charger, battery-care window), Thermal, System (CPU,
+GPU, memory, no-suspend switch, DSPs), Connections (Ethernet, Wi-Fi, Bluetooth, USB-C /
+DisplayPort, display brightness).
+"""
+import os
+import subprocess
+import sys
+import threading
+
+sys.path[:0] = [os.path.dirname(os.path.realpath(__file__)), "/usr/local/lib/guacamole"]
+import guacamole_common as gc  # noqa: E402
+
+import gi  # noqa: E402
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.guacamole.Panel"
+REFRESH_S = 2
+
+
+def set_brightness(name, value):
+    """systemd-logind lets the active session set backlight brightness."""
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    bus.call_sync("org.freedesktop.login1", "/org/freedesktop/login1/session/auto",
+                  "org.freedesktop.login1.Session", "SetBrightness",
+                  GLib.Variant("(ssu)", ("backlight", name, int(value))),
+                  None, Gio.DBusCallFlags.NONE, 2000, None)
+
+
+# ------------------------------------------------------------------- UI ----
+class ValueRow(Adw.ActionRow):
+    def __init__(self, title, subtitle=None):
+        super().__init__(title=title)
+        if subtitle:
+            self.set_subtitle(subtitle)
+        # wrap only when the row is too narrow (long policy text on a phone)
+        self.value = Gtk.Label(xalign=1, wrap=True, wrap_mode=2, justify=Gtk.Justification.RIGHT)
+        if hasattr(Gtk, "NaturalWrapMode"):
+            self.value.set_natural_wrap_mode(Gtk.NaturalWrapMode.NONE)
+        self.value.add_css_class("dim-label")
+        self.add_suffix(self.value)
+
+    def set(self, text):
+        text = "—" if text in (None, "") else str(text)
+        if self.value.get_label() != text:
+            self.value.set_label(text)
+
+
+def group(page, title, description=None):
+    g = Adw.PreferencesGroup(title=title)
+    if description:
+        g.set_description(description)
+    page.add(g)
+    return g
+
+
+class Panel(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Guacamole Panel")
+        self.set_default_size(460, 860)
+        self.toasts = Adw.ToastOverlay()
+        stack = Adw.ViewStack()
+        self.rows = {}
+
+        stack.add_titled_with_icon(self.battery_page(), "battery", "Battery", "battery-level-80-symbolic")
+        stack.add_titled_with_icon(self.thermal_page(), "thermal", "Thermal", "power-profile-performance-symbolic")
+        stack.add_titled_with_icon(self.system_page(), "system", "System", "computer-symbolic")
+        stack.add_titled_with_icon(self.conn_page(), "conn", "Connections", "network-wireless-symbolic")
+
+        header = Adw.HeaderBar()
+        top_switcher = Adw.ViewSwitcher(stack=stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(top_switcher)
+        bottom = Adw.ViewSwitcherBar(stack=stack)
+        view = Adw.ToolbarView()
+        view.add_top_bar(header)
+        view.set_content(stack)
+        view.add_bottom_bar(bottom)
+        stack.set_visible_child_name(os.environ.get("GUAC_PAGE", "battery"))
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        # phone width: switcher at the bottom; wide (dock): in the header bar
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 600sp"))
+        bp.add_setter(bottom, "reveal", True)
+        bp.add_setter(top_switcher, "visible", False)
+        self.add_breakpoint(bp)
+
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_S, self.refresh)
+
+    # -- helpers --
+    def row(self, grp, key, title, subtitle=None):
+        r = ValueRow(title, subtitle)
+        grp.add(r)
+        self.rows[key] = r
+        return r
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def helper(self, args, ok_text, done=None):
+        def work():
+            try:
+                p = subprocess.run(["pkexec", gc.HELPER] + [str(a) for a in args],
+                                   capture_output=True, text=True, timeout=60)
+                ok = p.returncode == 0
+                msg = ok_text if ok else \
+                    "Failed: " + ((p.stderr or p.stdout).strip().splitlines() or ["not authorised"])[-1]
+            except (OSError, subprocess.SubprocessError) as e:
+                ok, msg = False, "Failed: %s" % e
+            GLib.idle_add(self.toast, msg)
+            if done:
+                GLib.idle_add(done, ok)
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- pages --
+    def battery_page(self):
+        page = Adw.PreferencesPage()
+        g = group(page, "Battery")
+        lvl = Adw.ActionRow(title="Charge")
+        self.level = Gtk.LevelBar(min_value=0, max_value=100, valign=Gtk.Align.CENTER, hexpand=True)
+        self.level.set_size_request(120, -1)
+        self.level_label = Gtk.Label(width_chars=5, xalign=1)
+        lvl.add_suffix(self.level)
+        lvl.add_suffix(self.level_label)
+        g.add(lvl)
+        for k, t in gc.BATTERY_ROWS:
+            self.row(g, k, t)
+
+        g = group(page, "Charger")
+        for k, t in gc.CHARGER_ROWS:
+            self.row(g, k, t)
+
+        g = group(page, "Battery care",
+                  "Charge to the limit, then run from the battery down to the resume level. "
+                  "Now and then the phone runs further down, to the deep-cycle level, once.")
+        self.sp_max = Adw.SpinRow.new_with_range(50, 100, 1)
+        self.sp_max.set_title("Charge limit (%)")
+        self.sp_res = Adw.SpinRow.new_with_range(20, 100, 1)
+        self.sp_res.set_title("Resume charging at (%)")
+        self.sp_deep = Adw.SpinRow.new_with_range(10, 100, 1)
+        self.sp_deep.set_title("Deep cycle down to (%)")
+        self.sp_days = Adw.SpinRow.new_with_range(0, 365, 1)
+        self.sp_days.set_title("Deep cycle every (days)")
+        self.sp_days.set_subtitle("0 turns deep cycles off; limit 100 turns the window off")
+        for s in (self.sp_max, self.sp_res, self.sp_deep, self.sp_days):
+            g.add(s)
+        self.conf_loaded = False
+        btns = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12)
+        b_apply = Gtk.Button(label="Apply")
+        b_apply.add_css_class("suggested-action")
+        b_apply.connect("clicked", self.on_apply_charge)
+        b_full = Gtk.Button(label="Charge to 100 % once")
+        b_full.connect("clicked", lambda *_: self.helper(["full-once"], "Charging to 100 % once"))
+        b_deep = Gtk.Button(label="Deep cycle now")
+        b_deep.connect("clicked", lambda *_: self.helper(["deep-now"], "Deep cycle started"))
+        for b in (b_apply, b_full, b_deep):
+            btns.append(b)
+        g.add(btns)
+        self.care_group = g
+        return page
+
+    def thermal_page(self):
+        page = Adw.PreferencesPage()
+        g = group(page, "Hot spots")
+        for k, t in gc.HOTSPOT_ROWS:
+            self.row(g, k, t)
+        g = group(page, "All sensors")
+        self.all_zones = Adw.ExpanderRow(title="Thermal zones")
+        g.add(self.all_zones)
+        self.zone_rows = {}
+        return page
+
+    def system_page(self):
+        page = Adw.PreferencesPage()
+        g = group(page, "Processor")
+        self.cpu_group = g
+        self.cpu_rows = []
+        self.gov_row = Adw.ComboRow(title="CPU governor",
+                                    subtitle="schedutil balances; performance pins top speed (hot, hungry)")
+        self.gov_model = Gtk.StringList()
+        self.gov_row.set_model(self.gov_model)
+        self.gov_row.connect("notify::selected", self.on_governor)
+        self.gov_lock = True
+        g.add(self.gov_row)
+        self.row(g, "gpu", "GPU (Adreno 640)")
+        g = group(page, "Power")
+        self.nosusp = Adw.SwitchRow(title="Keep awake (no suspend)",
+                                    subtitle="Server mode: blocks suspend and hibernate from every source "
+                                             "and survives reboots. The screen turns off after %d s without "
+                                             "locking, and Server Monitor opens at login." % gc.SERVER_SCREEN_OFF_S)
+        self.nosusp_lock = True
+        self.nosusp.connect("notify::active", self.on_nosuspend)
+        g.add(self.nosusp)
+        g = group(page, "Memory and system")
+        for k, t in gc.SYSTEM_ROWS:
+            self.row(g, k, t)
+        self.swap_row = Adw.ComboRow(title="Swap file",
+                                     subtitle="/swapfile, survives reboots; swappiness 10 so the "
+                                              "flash only sees it under memory pressure")
+        self.swap_row.set_model(Gtk.StringList.new(["Off"] + ["%s GB" % s for s in gc.SWAP_SIZES[1:]]))
+        self.swap_lock = True
+        self.swap_row.connect("notify::selected", self.on_swap)
+        g.add(self.swap_row)
+        g = group(page, "Co-processors", "Hexagon DSPs started by Linux (remoteproc)")
+        self.dsp_group = g
+        self.dsp_rows = {}
+        return page
+
+    def conn_page(self):
+        page = Adw.PreferencesPage()
+        g = group(page, "Ethernet")
+        for k, t in gc.ETH_ROWS:
+            self.row(g, k, t)
+        g = group(page, "Wi-Fi")
+        for k, t in gc.WIFI_ROWS:
+            self.row(g, k, t)
+        g = group(page, "Bluetooth")
+        self.row(g, "bt", "Radio")
+        g = group(page, "USB-C")
+        for k, t in gc.USBC_ROWS:
+            self.row(g, k, t)
+        g = group(page, "Display")
+        br = Adw.ActionRow(title="Brightness")
+        self.bright = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 100, 1)
+        self.bright.set_hexpand(True)
+        self.bright.set_size_request(160, -1)
+        self.bright.set_draw_value(False)
+        self.bright_busy = False
+        self.bright.connect("value-changed", self.on_brightness)
+        br.add_suffix(self.bright)
+        g.add(br)
+        return page
+
+    # -- actions --
+    def on_apply_charge(self, *_):
+        mx, rs = int(self.sp_max.get_value()), int(self.sp_res.get_value())
+        dp, dd = int(self.sp_deep.get_value()), int(self.sp_days.get_value())
+        if not (dp <= rs <= mx):
+            self.toast("Need: deep cycle level ≤ resume level ≤ charge limit")
+            return
+        self.helper(["charge", mx, rs, dp, dd], "Battery care: %d %% limit, resume %d %%" % (mx, rs))
+
+    def on_governor(self, row, _):
+        if self.gov_lock:
+            return
+        item = row.get_selected_item()
+        if item:
+            self.helper(["governor", item.get_string()], "CPU governor: %s" % item.get_string())
+
+    def on_nosuspend(self, row, _):
+        if self.nosusp_lock:
+            return
+        on = row.get_active()
+        self.nosusp.set_sensitive(False)
+
+        def done(ok):
+            self.nosusp.set_sensitive(True)
+            self.refresh_nosuspend()       # put the switch back if it failed
+            if ok:
+                threading.Thread(target=lambda: GLib.idle_add(
+                    self.toast, "Screen: " + gc.server_screen(on)), daemon=True).start()
+        self.helper(["nosuspend", "on" if on else "off"],
+                    "Suspend blocked (server mode)" if on else "Suspend allowed again", done)
+
+    def on_swap(self, row, _):
+        if self.swap_lock:
+            return
+        size = gc.SWAP_SIZES[row.get_selected()]
+        self.swap_row.set_sensitive(False)
+
+        def done(ok):
+            self.swap_row.set_sensitive(True)
+            self.refresh_system()           # shows the real state, also after a failure
+        self.helper(["swap", size], "Swap off" if size == "off" else "Swap file: %s GB" % size, done)
+
+    def on_brightness(self, scale):
+        if self.bright_busy:
+            return
+        name, _, mx = gc.backlight()
+        if name and mx:
+            try:
+                set_brightness(name, max(1, round(scale.get_value() * mx / 100)))
+            except GLib.Error as e:
+                self.toast("Brightness: %s" % e.message)
+
+    # -- refresh --
+    def refresh(self):
+        try:
+            self.refresh_battery()
+            self.refresh_thermal()
+            self.refresh_system()
+            self.refresh_conn()
+        except Exception as e:  # never let one bad read kill the timer
+            print("refresh:", repr(e))
+        return True
+
+    def set_rows(self, values):
+        for k, text in values.items():
+            if k in self.rows:
+                self.rows[k].set(text)
+
+    def refresh_battery(self):
+        b = gc.battery_values()
+        cap = b["capacity"]
+        self.level.set_value(cap or 0)
+        self.level_label.set_label("—" if cap is None else "%d %%" % cap)
+        self.set_rows(b)
+
+        st = gc.charger_status()
+        self.care_group.set_sensitive(st is not None)
+        self.set_rows(gc.charger_values(st))
+        c = (st or {}).get("conf") or {}
+        if not self.conf_loaded and c:
+            self.sp_max.set_value(c.get("CHG_MAX", 80))
+            self.sp_res.set_value(c.get("CHG_RESUME", 75))
+            self.sp_deep.set_value(c.get("DEEP_MIN", 60))
+            self.sp_days.set_value(c.get("DEEP_EVERY_DAYS", 7))
+            self.conf_loaded = True
+
+    def refresh_thermal(self):
+        z = gc.thermal_zones()
+        self.set_rows(gc.hotspot_values(z))
+        for name in sorted(z):
+            if name not in self.zone_rows:
+                row = ValueRow(name)
+                self.all_zones.add_row(row)
+                self.zone_rows[name] = row
+            self.zone_rows[name].set(gc.fmt_temp(z[name]))
+
+    def refresh_nosuspend(self, state=None):
+        state = state or gc.no_suspend()
+        self.nosusp_lock = True
+        self.nosusp.set_active(state == "on")
+        self.nosusp_lock = False
+
+    def refresh_system(self):
+        s = gc.system_values()
+        while len(self.cpu_rows) < len(s["cpus"]):
+            row = ValueRow("CPU")
+            self.cpu_group.add(row)
+            self.cpu_rows.append(row)
+        for row, (title, text) in zip(self.cpu_rows, s["cpus"]):
+            row.set_title(title)
+            row.set(text)
+        govs = s["govs"]
+        if govs:
+            if [self.gov_model.get_string(i) for i in range(self.gov_model.get_n_items())] != govs:
+                self.gov_lock = True
+                self.gov_model.splice(0, self.gov_model.get_n_items(), govs)
+            if s["gov"] in govs and self.gov_row.get_selected() != govs.index(s["gov"]):
+                self.gov_lock = True
+                self.gov_row.set_selected(govs.index(s["gov"]))
+            self.gov_lock = False
+        self.set_rows(s)
+        if self.swap_row.get_sensitive():   # not while a change is in flight
+            cur = str(s["swap_gb"]) if s["swap_gb"] else "off"
+            if cur in gc.SWAP_SIZES and self.swap_row.get_selected() != gc.SWAP_SIZES.index(cur):
+                self.swap_lock = True
+                self.swap_row.set_selected(gc.SWAP_SIZES.index(cur))
+            self.swap_lock = False
+        if self.nosusp.get_sensitive():     # not while a change is in flight
+            self.refresh_nosuspend(s["nosuspend"])
+        for name, state in s["dsps"]:
+            if name not in self.dsp_rows:
+                row = ValueRow(name)
+                self.dsp_group.add(row)
+                self.dsp_rows[name] = row
+            self.dsp_rows[name].set(state)
+
+    def refresh_conn(self):
+        c = gc.conn_values()
+        self.set_rows(c)
+        if c["brightness"] is not None and not self.bright.has_focus():
+            self.bright_busy = True
+            self.bright.set_value(c["brightness"])
+            self.bright_busy = False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Panel(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    App().run(None)

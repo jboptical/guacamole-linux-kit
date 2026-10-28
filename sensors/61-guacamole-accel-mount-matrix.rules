@@ -1,0 +1,5 @@
+# The LSM6DSM is mounted rotated 180 degrees about Z relative to the screen:
+# without this the screen rotates upside down in every orientation. SEE's own
+# placement matrix is not usable by iio-sensor-proxy, so give it the mount
+# matrix here. The SSC accelerometer is attached to the FastRPC nodes.
+SUBSYSTEM=="misc", KERNEL=="fastrpc-*", ENV{ACCEL_MOUNT_MATRIX}="-1, 0, 0; 0, -1, 0; 0, 0, 1"

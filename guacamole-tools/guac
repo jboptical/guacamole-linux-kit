@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""guac: the Guacamole Panel in a terminal (OnePlus 7 Pro, mainline).
+
+Same data and the same controls as the panel, shared through
+guacamole_common; works over SSH. Changes that need root go through
+/usr/local/libexec/guacamole-helper: run directly as root, through sudo when
+it needs no password, otherwise pkexec (asks in the terminal).
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path[:0] = [os.path.dirname(os.path.realpath(__file__)), "/usr/local/lib/guacamole"]
+import guacamole_common as gc  # noqa: E402
+
+SECTIONS = ("battery", "thermal", "system", "net")
+
+
+# --------------------------------------------------------------- output ----
+def show_rows(title, rows, values):
+    if title:
+        print(title)
+    width = max(len(t) for _, t in rows)
+    for k, t in rows:
+        v = values.get(k)
+        print("  %-*s  %s" % (width, t, "—" if v in (None, "") else v))
+    print()
+
+
+def show_pairs(title, pairs):
+    print(title)
+    if pairs:
+        width = max(len(t) for t, _ in pairs)
+        for t, v in pairs:
+            print("  %-*s  %s" % (width, t, "—" if v in (None, "") else v))
+    print()
+
+
+def collect(section, all_zones=False):
+    """One section as plain data (for --json and for printing)."""
+    if section == "battery":
+        st = gc.charger_status()
+        return {"battery": gc.battery_values(), "charger": gc.charger_values(st),
+                "care": (st or {}).get("conf")}
+    if section == "thermal":
+        z = gc.thermal_zones()
+        d = {"hotspots": gc.hotspot_values(z)}
+        if all_zones:
+            d["zones"] = {n: gc.fmt_temp(z[n]) for n in sorted(z)}
+        return d
+    if section == "system":
+        return gc.system_values()
+    return gc.conn_values()
+
+
+def show(section, all_zones=False):
+    d = collect(section, all_zones)
+    if section == "battery":
+        b = d["battery"]
+        cap = b["capacity"]
+        bar = "" if cap is None else " [%-20s]" % ("#" * (cap // 5))
+        print("Battery")
+        print("  %-13s  %s%s" % ("Charge", "—" if cap is None else "%d %%" % cap, bar))
+        show_rows("", gc.BATTERY_ROWS, b)
+        show_rows("Charger", gc.CHARGER_ROWS, d["charger"])
+        c = d["care"]
+        if c:
+            show_pairs("Battery care", [
+                ("Charge limit", "%s %%" % c.get("CHG_MAX")),
+                ("Resume charging at", "%s %%" % c.get("CHG_RESUME")),
+                ("Deep cycle down to", "%s %%" % c.get("DEEP_MIN")),
+                ("Deep cycle every", "%s days" % c.get("DEEP_EVERY_DAYS"))])
+    elif section == "thermal":
+        show_rows("Hot spots", gc.HOTSPOT_ROWS, d["hotspots"])
+        if "zones" in d:
+            show_pairs("All sensors", list(d["zones"].items()))
+    elif section == "system":
+        show_pairs("Processor", d["cpus"] + [("CPU governor", "%s (available: %s)" % (
+            d["gov"], " ".join(d["govs"]))), ("GPU (Adreno 640)", d["gpu"])])
+        show_pairs("Power", [("Keep awake (no suspend)", d["nosuspend"])])
+        show_rows("Memory and system", gc.SYSTEM_ROWS, d)
+        show_pairs("Co-processors", d["dsps"])
+    else:
+        show_rows("Ethernet", gc.ETH_ROWS, d)
+        show_rows("Wi-Fi", gc.WIFI_ROWS, d)
+        show_pairs("Bluetooth", [("Radio", d["bt"])])
+        show_rows("USB-C", gc.USBC_ROWS, d)
+        show_pairs("Display", [("Screen", d["screen"]),
+                               ("Brightness", None if d["brightness"] is None else "%d %%" % d["brightness"])])
+
+
+# -------------------------------------------------------------- actions ----
+def helper(args, ok_text):
+    cmd = gc.helper_cmd(args)
+    try:
+        rc = subprocess.run(cmd).returncode
+    except OSError as e:
+        print("guac: cannot run %s: %s" % (cmd[0], e), file=sys.stderr)
+        return 1
+    if rc == 0:
+        print(ok_text)
+    else:
+        print("guac: failed (%s exited with %d)" % (os.path.basename(cmd[0]), rc), file=sys.stderr)
+    return rc
+
+
+def set_brightness(percent):
+    name, _, mx = gc.backlight()
+    if not name or not mx:
+        print("guac: no backlight found", file=sys.stderr)
+        return 1
+    if gc.screen_on() is False:
+        print("guac: the screen is off; the panel only takes brightness changes while it is on",
+              file=sys.stderr)
+        return 1
+    value = max(1, round(percent * mx / 100))
+    # logind allows it for the active graphical session; over SSH fall back to the helper
+    p = subprocess.run(["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1/session/auto",
+                        "org.freedesktop.login1.Session", "SetBrightness", "ssu", "backlight", name, str(value)],
+                       capture_output=True, text=True)
+    if p.returncode == 0:
+        print("Brightness: %d %%" % percent)
+        return 0
+    return helper(["brightness", value], "Brightness: %d %%" % percent)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="guac", description="Guacamole Panel in a terminal: status and controls for the OnePlus 7 Pro.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""examples:
+  guac                          everything once
+  guac battery                  one section: battery, thermal, system, net
+  guac thermal --all            hot spots plus every thermal zone
+  guac watch system -n 5        refresh a section every 5 s (Ctrl-C stops)
+  guac status --json            machine-readable
+  guac no-suspend on            server mode: keep awake (survives reboots), screen off
+                                after 15 s, no lock screen, Server Monitor at login
+  guac charge 80 75 60 7        battery care: limit, resume, deep-cycle level, every N days
+  guac charge full-once         charge to 100 % once
+  guac governor performance     CPU governor for all clusters
+  guac swap 4                   4 GB swap file (off, 1, 2, 4, 8; survives reboots)
+  guac brightness 40            display brightness in %""")
+    sub = ap.add_subparsers(dest="cmd")
+    for name in ("status",) + SECTIONS:
+        p = sub.add_parser(name, help="show %s" % ("everything" if name == "status" else "the %s section" % name))
+        p.add_argument("--json", action="store_true", help="print JSON")
+        p.add_argument("--all", action="store_true", help="list every thermal zone")
+    p = sub.add_parser("watch", help="refresh a section (or everything) until Ctrl-C")
+    p.add_argument("section", nargs="?", choices=("status",) + SECTIONS, default="status")
+    p.add_argument("-n", type=float, default=2, metavar="SECS", help="interval (default 2)")
+    p = sub.add_parser("no-suspend", help="show, or turn on/off, keep-awake (blocks suspend)")
+    p.add_argument("state", nargs="?", choices=("on", "off"))
+    p = sub.add_parser("charge", help="show or set battery care, or full-once / deep-now")
+    p.add_argument("args", nargs="*", metavar="MAX RESUME DEEP DAYS | full-once | deep-now")
+    p = sub.add_parser("governor", help="show or set the CPU governor")
+    p.add_argument("name", nargs="?")
+    p = sub.add_parser("swap", help="show or set the swap file (off, 1, 2, 4 or 8 GB)")
+    p.add_argument("size", nargs="?", choices=gc.SWAP_SIZES)
+    p = sub.add_parser("brightness", help="show or set display brightness (percent)")
+    p.add_argument("percent", nargs="?", type=int)
+    a = ap.parse_args()
+    cmd = a.cmd or "status"
+
+    if cmd in ("status",) + SECTIONS:
+        secs = SECTIONS if cmd == "status" else (cmd,)
+        all_zones = getattr(a, "all", False)
+        if getattr(a, "json", False):
+            data = {s: collect(s, all_zones) for s in secs}
+            print(json.dumps(data if cmd == "status" else data[cmd], indent=2, ensure_ascii=False))
+        else:
+            for s in secs:
+                show(s, all_zones)
+        return 0
+
+    if cmd == "watch":
+        secs = SECTIONS if a.section == "status" else (a.section,)
+        try:
+            while True:
+                sys.stdout.write("\033[H\033[2J")
+                print("guac  %s  (every %g s, Ctrl-C stops)\n" % (time.strftime("%H:%M:%S"), a.n))
+                for s in secs:
+                    show(s)
+                sys.stdout.flush()
+                time.sleep(a.n)
+        except KeyboardInterrupt:
+            return 0
+
+    if cmd == "no-suspend":
+        if a.state is None:
+            print("Keep awake (no suspend): %s" % gc.no_suspend())
+            return 0
+        rc = helper(["nosuspend", a.state],
+                    "Suspend blocked (server mode)" if a.state == "on" else "Suspend allowed again")
+        if rc == 0:
+            print("Screen: %s" % gc.server_screen(a.state == "on"))
+        return rc
+
+    if cmd == "charge":
+        if not a.args:
+            show("battery")
+            return 0
+        if a.args in (["full-once"], ["deep-now"]):
+            return helper(a.args, "Charging to 100 % once" if a.args[0] == "full-once" else "Deep cycle started")
+        try:
+            mx, rs, dp, dd = (int(x) for x in a.args)
+        except ValueError:
+            ap.error("charge takes MAX RESUME DEEP DAYS (numbers), full-once or deep-now")
+        if not (dp <= rs <= mx):
+            ap.error("need: deep cycle level <= resume level <= charge limit")
+        return helper(["charge", mx, rs, dp, dd], "Battery care: %d %% limit, resume %d %%" % (mx, rs))
+
+    if cmd == "governor":
+        s = gc.system_values()
+        if not a.name:
+            print("CPU governor: %s (available: %s)" % (s["gov"], " ".join(s["govs"])))
+            return 0
+        if a.name not in s["govs"]:
+            ap.error("governor %s not available (have: %s)" % (a.name, " ".join(s["govs"])))
+        return helper(["governor", a.name], "CPU governor: %s" % a.name)
+
+    if cmd == "swap":
+        if a.size is None:
+            print("Swap: %s" % gc.swap_text())
+            return 0
+        print("Setting up swap..." if a.size != "off" else "Turning swap off...")
+        rc = helper(["swap", a.size], "Swap: %s" % ("off" if a.size == "off" else "%s GB swap file" % a.size))
+        if rc == 0:
+            print("Swap: %s" % gc.swap_text())
+        return rc
+
+    if cmd == "brightness":
+        if a.percent is None:
+            c = gc.conn_values()
+            b = c["brightness"]
+            print("Brightness: %s%s" % ("—" if b is None else "%d %%" % b,
+                                        " (screen off)" if c["screen"] == "off" else ""))
+            return 0
+        if not 1 <= a.percent <= 100:
+            ap.error("brightness is 1-100 (%)")
+        return set_brightness(a.percent)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

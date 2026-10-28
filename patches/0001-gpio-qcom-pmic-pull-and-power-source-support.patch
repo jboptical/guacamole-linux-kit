@@ -1,0 +1,138 @@
+diff --git a/drivers/gpio/qcom_pmic_gpio.c b/drivers/gpio/qcom_pmic_gpio.c
+index ad4a70dd..4bbeb43f 100644
+--- a/drivers/gpio/qcom_pmic_gpio.c
++++ b/drivers/gpio/qcom_pmic_gpio.c
+@@ -9,6 +9,7 @@
+ #include <dm/device-internal.h>
+ #include <dm/lists.h>
+ #include <dm/pinctrl.h>
++#include <dm/ofnode.h>
+ #include <log.h>
+ #include <power/pmic.h>
+ #include <spmi/spmi.h>
+@@ -57,6 +58,8 @@
+ 
+ #define REG_DIG_PULL_CTL       0x42
+ #define REG_DIG_PULL_NO_PU     0x5
++#define REG_DIG_PULL_UP_30UA   0x0
++#define REG_DIG_PULL_DOWN_10UA 0x4
+ 
+ #define REG_LV_MV_OUTPUT_CTL	0x44
+ #define REG_LV_MV_OUTPUT_CTL_MASK	0x80
+@@ -154,6 +157,61 @@ static int qcom_gpio_set_direction(struct udevice *dev, unsigned int offset,
+ 			       REG_EN_CTL_ENABLE);
+ }
+ 
++/*
++ * Honour GPIOD_PULL_UP / GPIOD_PULL_DOWN (e.g. from "gpios = <... GPIO_PULL_UP>")
++ * so buttons wired to ground (like phone volume keys) read correctly.
++ * Without this, configuring an input always selects "no pull".
++ */
++/*
++ * Apply "power-source" (VIN select) from any pin state node of this PMIC GPIO
++ * block whose "pins" names this GPIO (e.g. key-vol-down-state { pins = "gpio7";
++ * power-source = <1>; }). On the OnePlus 7 Pro, the Vol Down GPIO reads low
++ * forever on VIN0 and only works on VIN1, and the pinctrl state isn't always
++ * applied before the GPIO is claimed, so do it here too.
++ */
++static void qcom_gpio_apply_dt_vin(struct udevice *dev, unsigned int offset)
++{
++	struct qcom_pmic_gpio_data *plat = dev_get_plat(dev);
++	uint32_t gpio_base = plat->pid + REG_OFFSET(offset);
++	char name[8];
++	ofnode node;
++	u32 vin;
++
++	snprintf(name, sizeof(name), "gpio%u", offset + 1);
++	dev_for_each_subnode(node, dev) {
++		const char *pins = ofnode_read_string(node, "pins");
++
++		if (!pins || strcmp(pins, name))
++			continue;
++		if (!ofnode_read_u32(node, "power-source", &vin))
++			pmic_reg_write(plat->pmic, gpio_base + REG_DIG_VIN_CTL, vin & 0x7);
++	}
++}
++
++static int qcom_gpio_set_flags(struct udevice *dev, unsigned int offset, ulong flags)
++{
++	struct qcom_pmic_gpio_data *plat = dev_get_plat(dev);
++	uint32_t gpio_base = plat->pid + REG_OFFSET(offset);
++	bool input = !(flags & GPIOD_IS_OUT);
++	int ret;
++
++	ret = qcom_gpio_set_direction(dev, offset, input,
++				      !!(flags & GPIOD_IS_OUT_ACTIVE));
++	if (ret < 0)
++		return ret;
++
++	if (input)
++		qcom_gpio_apply_dt_vin(dev, offset);
++
++	if (flags & GPIOD_PULL_UP)
++		return pmic_reg_write(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_UP_30UA);
++	if (flags & GPIOD_PULL_DOWN)
++		return pmic_reg_write(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_DOWN_10UA);
++	return 0;
++}
++
+ static int qcom_gpio_direction_input(struct udevice *dev, unsigned offset)
+ {
+ 	return qcom_gpio_set_direction(dev, offset, true, 0);
+@@ -256,6 +314,7 @@ static const struct dm_gpio_ops qcom_gpio_ops = {
+ 	.set_value		= qcom_gpio_set_value,
+ 	.get_function		= qcom_gpio_get_function,
+ 	.xlate			= qcom_gpio_xlate,
++	.set_flags		= qcom_gpio_set_flags,
+ };
+ 
+ static int qcom_gpio_bind(struct udevice *dev)
+@@ -364,6 +423,11 @@ U_BOOT_DRIVER(qcom_pmic_gpio) = {
+ static const struct pinconf_param qcom_pmic_pinctrl_conf_params[] = {
+ 	{ "output-high", PIN_CONFIG_OUTPUT_ENABLE, 1 },
+ 	{ "output-low", PIN_CONFIG_OUTPUT, 0 },
++	{ "input-enable", PIN_CONFIG_INPUT_ENABLE, 1 },
++	{ "bias-pull-up", PIN_CONFIG_BIAS_PULL_UP, 1 },
++	{ "bias-pull-down", PIN_CONFIG_BIAS_PULL_DOWN, 1 },
++	{ "bias-disable", PIN_CONFIG_BIAS_DISABLE, 0 },
++	{ "power-source", PIN_CONFIG_POWER_SOURCE, 0 },
+ };
+ 
+ static int qcom_pmic_pinctrl_get_pins_count(struct udevice *dev)
+@@ -386,9 +450,31 @@ static const char *qcom_pmic_pinctrl_get_pin_name(struct udevice *dev, unsigned
+ static int qcom_pmic_pinctrl_pinconf_set(struct udevice *dev, unsigned int selector,
+ 					 unsigned int param, unsigned int arg)
+ {
+-	/* We only support configuring the pin as an output, either low or high */
+-	return _qcom_gpio_set_direction(dev, selector, false,
+-					param == PIN_CONFIG_OUTPUT_ENABLE);
++	struct qcom_pmic_gpio_data *plat = dev_get_plat(dev);
++	u32 gpio_base = plat->pid + REG_OFFSET(selector);
++
++	switch (param) {
++	case PIN_CONFIG_OUTPUT_ENABLE:
++	case PIN_CONFIG_OUTPUT:
++		return _qcom_gpio_set_direction(dev, selector, false,
++						param == PIN_CONFIG_OUTPUT_ENABLE);
++	case PIN_CONFIG_INPUT_ENABLE:
++		return _qcom_gpio_set_direction(dev, selector, true, 0);
++	case PIN_CONFIG_BIAS_PULL_UP:
++		return pmic_reg_write(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_UP_30UA);
++	case PIN_CONFIG_BIAS_PULL_DOWN:
++		return pmic_reg_write(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_DOWN_10UA);
++	case PIN_CONFIG_BIAS_DISABLE:
++		return pmic_reg_write(plat->pmic, gpio_base + REG_DIG_PULL_CTL,
++				      REG_DIG_PULL_NO_PU);
++	case PIN_CONFIG_POWER_SOURCE:
++		/* VIN selection, e.g. power-source = <1> for the 1.8 V rail */
++		return pmic_reg_write(plat->pmic, gpio_base + REG_DIG_VIN_CTL, arg & 0x7);
++	default:
++		return 0;
++	}
+ }
+ 
+ static const char *qcom_pmic_pinctrl_get_function_name(struct udevice *dev, unsigned int selector)

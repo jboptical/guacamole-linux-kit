@@ -1,0 +1,67 @@
+From: guacamole linux-kit
+Subject: [PATCH] drm/msm/dsi: wait for the command-mode MDP stream before DCS
+
+dsi_cmd_dma_tx() only waits for the link in video mode. In command mode a
+DCS command can be triggered while the MDP is still pushing a frame. On the
+OnePlus 7 Pro's Samsung DSC panel this happens when the backlight writes the
+brightness (systemd-backlight at boot, powerdevil fades): the controller
+reports a FIFO error (dsi_err_worker: status=4) and the panel shows coloured
+static until it is re-initialised by a sleep/wake cycle.
+
+Poll DSI_STATUS0.CMD_MODE_MDP_BUSY before triggering the command DMA, for
+up to 20 ms (one frame at 90 Hz is ~11 ms). This narrows the window but
+does not close it: a new frame can still start right after the check. The
+vendor driver schedules commands against the TE signal instead.
+---
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -8,6 +8,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/interrupt.h>
++#include <linux/iopoll.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
+@@ -1189,6 +1190,33 @@
+ 	}
+ }
+ 
++/*
++ * In command mode the MDP pushes each frame over the same link that DCS
++ * commands use. A command triggered while that transfer is running (for
++ * example a brightness write from the panel's backlight) collides with it:
++ * the controller reports a FIFO error and a DSC panel can keep showing
++ * garbage until it is re-initialised. Wait for the MDP stream to go idle
++ * first. A frame at 90 Hz takes about 11 ms; after 20 ms send anyway.
++ */
++static void dsi_wait4cmd_mdp_idle(struct msm_dsi_host *msm_host)
++{
++	u32 data;
++	int ret;
++
++	if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)
++		return;
++
++	if (!msm_host->power_on || !msm_host->enabled)
++		return;
++
++	ret = readl_poll_timeout(msm_host->ctrl_base + REG_DSI_STATUS0, data,
++				 !(data & DSI_STATUS0_CMD_MODE_MDP_BUSY),
++				 50, 20000);
++	if (ret)
++		pr_warn_ratelimited("%s: MDP stream still busy, sending command anyway\n",
++				    __func__);
++}
++
+ int dsi_tx_buf_alloc_6g(struct msm_dsi_host *msm_host, int size)
+ {
+ 	struct drm_device *dev = msm_host->dev;
+@@ -1405,6 +1433,7 @@
+ 	reinit_completion(&msm_host->dma_comp);
+ 
+ 	dsi_wait4video_eng_busy(msm_host);
++	dsi_wait4cmd_mdp_idle(msm_host);
+ 
+ 	triggered = msm_dsi_manager_cmd_xfer_trigger(
+ 						msm_host->id, dma_base, len);

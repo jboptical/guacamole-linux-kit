@@ -1,0 +1,32 @@
+From: guacamole linux-kit
+Subject: [PATCH] drm/msm: only drop the shared resv reference for NO_SHARE objects
+
+msm_gem_free_object() assumed every object whose resv is not its own uses a
+VM-shared resv it holds a reference on. Imported dma-bufs point at the
+exporter's resv instead, so freeing one WARNed (msm_gem.c:1127, dozens of
+times per session under KWin) and then did a drm_gem_object_put() on a
+pointer computed with container_of() from memory that is not a GEM object.
+Same fix as upstream: check MSM_BO_NO_SHARE first.
+---
+--- a/drivers/gpu/drm/msm/msm_gem.c
++++ b/drivers/gpu/drm/msm/msm_gem.c
+@@ -1120,12 +1120,16 @@
+ 		put_pages(obj);
+ 	}
+ 
+-	if (obj->resv != &obj->_resv) {
++	/*
++	 * Only objects created with MSM_BO_NO_SHARE point at a shared resv
++	 * that we hold a reference on. Imported dma-bufs point at the
++	 * exporter's resv, which is not embedded in a drm_gem_object, so a
++	 * put here would decrement a random location in memory.
++	 */
++	if ((msm_obj->flags & MSM_BO_NO_SHARE) && (obj->resv != &obj->_resv)) {
+ 		struct drm_gem_object *r_obj =
+ 			container_of(obj->resv, struct drm_gem_object, _resv);
+ 
+-		WARN_ON(!(msm_obj->flags & MSM_BO_NO_SHARE));
+-
+ 		/* Drop reference we hold to shared resv obj: */
+ 		drm_gem_object_put(r_obj);
+ 	}

@@ -1,0 +1,72 @@
+#!/bin/sh
+# USB CDC-NCM ethernet gadget for the OnePlus 7 Pro: the PC reaches the phone at
+# 10.66.0.1 (give the PC side 10.66.0.2/24). Installed to /usr/local/sbin and run
+# by usb-gadget-net.service.
+#
+# Windows notes: the device must announce IAD class codes (EF/02/01), or the
+# Windows composite driver fails with Code 10. The MS OS "WINNCM" compatible ID
+# makes Windows 10 2004+/11 load its built-in UsbNcm driver automatically.
+set -u
+modprobe libcomposite 2>/dev/null
+mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config
+G=/sys/kernel/config/usb_gadget/g1
+[ -e $G/UDC ] && [ -n "$(cat $G/UDC 2>/dev/null)" ] && exit 0
+mkdir -p $G && cd $G || exit 1
+
+echo 0x1d6b > idVendor          # Linux Foundation
+echo 0x0104 > idProduct         # Multifunction Composite Gadget
+echo 0x0100 > bcdDevice
+echo 0x0200 > bcdUSB
+echo 0xEF > bDeviceClass        # Miscellaneous
+echo 0x02 > bDeviceSubClass     # Common Class
+echo 0x01 > bDeviceProtocol     # Interface Association Descriptor
+
+mkdir -p strings/0x409
+SERIAL=$(tr -d '\0' < /proc/device-tree/serial-number 2>/dev/null || true)
+[ -n "$SERIAL" ] || SERIAL=$(cat /etc/machine-id 2>/dev/null | cut -c1-16)
+echo "$SERIAL"        > strings/0x409/serialnumber
+echo "OnePlus"        > strings/0x409/manufacturer
+echo "OnePlus 7 Pro"  > strings/0x409/product
+
+mkdir -p configs/c.1/strings/0x409
+echo "NCM network"    > configs/c.1/strings/0x409/configuration
+echo 250              > configs/c.1/MaxPower
+
+mkdir -p functions/ncm.usb0
+# stable MACs so Windows keeps the same adapter (and its IP setting) every boot
+echo 02:66:00:00:00:01 > functions/ncm.usb0/dev_addr  2>/dev/null
+echo 02:66:00:00:00:02 > functions/ncm.usb0/host_addr 2>/dev/null
+
+# Microsoft OS descriptors -> Windows binds UsbNcm without an .inf
+if [ -d os_desc ]; then
+	echo 1        > os_desc/use
+	echo 0xcd     > os_desc/b_vendor_code
+	echo MSFT100  > os_desc/qw_sign
+	if [ -d functions/ncm.usb0/os_desc/interface.ncm ]; then
+		echo WINNCM > functions/ncm.usb0/os_desc/interface.ncm/compatible_id
+	fi
+	[ -e os_desc/c.1 ] || ln -s configs/c.1 os_desc/
+fi
+
+[ -e configs/c.1/ncm.usb0 ] || ln -s functions/ncm.usb0 configs/c.1/
+
+UDC_NAME=""
+for i in $(seq 1 20); do
+	UDC_NAME=$(ls /sys/class/udc 2>/dev/null | head -n1)
+	[ -n "$UDC_NAME" ] && break
+	sleep 1
+done
+[ -n "$UDC_NAME" ] || { echo "usb-gadget-net: no UDC found" >&2; exit 1; }
+echo "$UDC_NAME" > UDC
+
+# find the interface by its fixed MAC (udev may rename usb0 to enx...)
+IF=""
+for i in $(seq 1 10); do
+	IF=$(ip -o link | awk -F': ' 'tolower($0) ~ /02:66:00:00:00:01/ {print $2; exit}' | cut -d@ -f1)
+	[ -n "$IF" ] || IF=$(cat functions/ncm.usb0/ifname 2>/dev/null)
+	[ -n "$IF" ] && ip link show "$IF" >/dev/null 2>&1 && break
+	sleep 1
+done
+ip addr add 10.66.0.1/24 dev "$IF" 2>/dev/null
+ip link set "$IF" up
+echo "usb-gadget-net: $IF up as 10.66.0.1/24 on $UDC_NAME"

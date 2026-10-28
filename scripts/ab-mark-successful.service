@@ -1,0 +1,8 @@
+[Unit]
+Description=Mark A/B boot slot successful (OnePlus ABL retry counter)
+After=local-fs.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ab-mark-successful
+[Install]
+WantedBy=multi-user.target

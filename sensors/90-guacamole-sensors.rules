@@ -1,0 +1,4 @@
+# Start the SLPI sensor file server and iio-sensor-proxy once the sensor DSP's
+# FastRPC channel exists. The DSP boots about 12 s into the boot, so a plain
+# multi-user.target start of either service runs before the device node is there.
+SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp", TAG+="systemd", ENV{SYSTEMD_WANTS}+="guacamole-sensors-registry.service hexagonrpcd-sdsp.service iio-sensor-proxy.service"

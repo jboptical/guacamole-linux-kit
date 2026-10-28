@@ -1,0 +1,5 @@
+# iio-sensor-proxy's own rule (80-iio-sensor-proxy.rules) only enables
+# "ssc-light ssc-compass" on the FastRPC nodes. The OnePlus 7 Pro's SLPI also
+# serves the LSM6DSM accelerometer (auto-rotate) and the TCS3701 proximity
+# sensor, so list every SSC type iio-sensor-proxy knows.
+SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp", ENV{IIO_SENSOR_PROXY_TYPE}="ssc-accel ssc-light ssc-proximity ssc-compass"

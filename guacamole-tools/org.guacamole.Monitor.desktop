@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Server Monitor
+GenericName=Full-screen server status
+Comment=OnePlus 7 Pro server status: services, battery, CPU, memory, storage, network, temperature
+Exec=guacamole-monitor
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=server;monitor;status;dashboard;oneplus;
+StartupNotify=true
+X-KDE-FormFactor=desktop;tablet;handset;
+X-Purism-FormFactor=Workstation;Mobile;

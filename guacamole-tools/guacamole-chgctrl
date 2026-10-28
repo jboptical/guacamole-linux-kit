@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""Charge policy for the OnePlus 7 Pro on mainline Linux (any distro, systemd).
+
+Based on guacamole_nura's guacamole-chgctrl (GPL-3.0), which sets the input
+current from the USB-PD contract / charger type and throttles on battery
+temperature. Added here: a battery-care charge window with an occasional
+deeper discharge.
+
+  - charge to CHG_MAX (80 %), then hold. With kernel patch 0105 (in this kit:
+    pm8150b-charger/charge_behaviour) the hold is "inhibit-charge": the charger
+    keeps powering the phone and the battery sits idle at that charge, no
+    cycling. Older kernels: the charger input is suspended instead, so the
+    phone runs from the battery (USB data and DisplayPort keep working);
+  - normally resume at CHG_RESUME (75 %), so the battery sits between 75-80 %;
+  - every DEEP_EVERY_DAYS days, resume only at DEEP_MIN (60 %) instead: one
+    deeper cycle, which also keeps the fuel gauge's capacity learning honest;
+  - "charge to 100 % once" (flag file, set by guacamole-panel) for travel days.
+
+Config:  /etc/guacamole/chgctrl.conf   (reload: systemctl reload guacamole-chgctrl)
+State:   /var/lib/guacamole/chgctrl.json   (last deep cycle)
+Status:  /run/guacamole/chgctrl.json, /run/guacamole/charger, `guacamole-chgctrl status`
+Flags:   /var/lib/guacamole/full-once, /var/lib/guacamole/deep-now (consumed)
+"""
+import glob
+import json
+import os
+import signal
+import sys
+import time
+
+ROOT = os.environ.get("GUAC_ROOT", "")          # test hook: fake sysfs root
+PSY = ROOT + "/sys/class/power_supply"
+CHARGER = PSY + "/pm8150b-charger"
+CHARGE_BEHAVIOUR = CHARGER + "/charge_behaviour"   # kernel patch 0105: auto | inhibit-charge
+BATTERY = PSY + "/bq27411-0"
+UDC = ROOT + "/sys/class/udc"
+TYPEC_PREFIX = "tcpm-source-psy-"
+CONF_FILE = ROOT + "/etc/guacamole/chgctrl.conf"
+STATE_DIR = ROOT + "/var/lib/guacamole"
+STATE_FILE = STATE_DIR + "/chgctrl.json"
+FLAG_FULL = STATE_DIR + "/full-once"
+FLAG_DEEP = STATE_DIR + "/deep-now"
+RUN_DIR = ROOT + "/run/guacamole"
+
+ICL_PD_MAX_UA = 3000000     # board ceiling: the connector sinks 5 V / 3 A
+ICL_DCP_UA = 1800000        # stock qcom,usb-icl-ua
+ICL_CDP_UA = 1500000
+ICL_SDP_UA = 500000         # USB 2 configured device
+ICL_SDP_SS_UA = 900000      # USB 3 configured device
+ICL_HOT_UA = 1000000        # stock thermal mitigation step
+TEMP_WARM = 420             # 42.0 C: throttle
+TEMP_HOT = 450              # 45.0 C: suspend input
+TEMP_HYST = 20              # 2.0 C
+POLL_S = int(os.environ.get("GUAC_POLL_S", "5"))
+# phone draw on the charger: charger sensor x K, K calibrated on battery
+K_DEFAULT = 4.2             # measured 3.9-4.5 on 2026-10-26, until the first calibration
+K_RANGE = (2.0, 9.0)        # a calibration outside this is rejected
+CAL_EVERY_S = int(os.environ.get("GUAC_CAL_EVERY_S", str(4 * 3600)))
+CAL_SETTLE_S = 8            # after suspending the input, before measuring
+CAL_MEASURE_S = int(os.environ.get("GUAC_CAL_MEASURE_S", "60"))
+CAL_MIN_SENSOR_N = max(1, 60 // POLL_S)   # a full minute of idle sensor samples before a calibration
+IDLE_SETTLE_N = 3           # samples dropped after the battery becomes idle (input/gauge settling)
+
+DEFAULTS = {"CHG_MAX": 80, "CHG_RESUME": 75, "DEEP_MIN": 60, "DEEP_EVERY_DAYS": 7,
+            "CHG_SDP_UA": 0}
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path, default=0):
+    try:
+        return int(read(path))
+    except (TypeError, ValueError):
+        return default
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError as e:
+        print("chgctrl: write %s=%s failed: %s" % (path, value, e), file=sys.stderr)
+        return False
+
+
+def atomic_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        for line in open(CONF_FILE):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            conf[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    for k, d in DEFAULTS.items():
+        try:
+            conf[k] = int(conf[k])
+        except (TypeError, ValueError):
+            conf[k] = d
+    # sanity: 50 <= max <= 100, deep <= resume <= max
+    conf["CHG_MAX"] = min(100, max(50, conf["CHG_MAX"]))
+    conf["CHG_RESUME"] = min(conf["CHG_MAX"], max(20, conf["CHG_RESUME"]))
+    conf["DEEP_MIN"] = min(conf["CHG_RESUME"], max(10, conf["DEEP_MIN"]))
+    conf["DEEP_EVERY_DAYS"] = max(0, conf["DEEP_EVERY_DAYS"])
+    return conf
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        s = {}
+    s.setdefault("last_deep", 0)
+    return s
+
+
+def save_state(s):
+    atomic_write(STATE_FILE, json.dumps(s) + "\n")
+
+
+def battery_percent():
+    cap = read_int(BATTERY + "/capacity", -1)
+    if cap >= 0:
+        return cap
+    now = read_int(BATTERY + "/charge_now", -1)
+    full = read_int(BATTERY + "/charge_full", 0)
+    if now >= 0 and full > 0:
+        return min(100, max(0, now * 100 // full))
+    return -1
+
+
+def typec_psy():
+    try:
+        for name in sorted(os.listdir(PSY)):
+            if name.startswith(TYPEC_PREFIX):
+                return PSY + "/" + name
+    except OSError:
+        pass
+    return None
+
+
+def selected(prop):
+    """power_supply enum properties print 'a [b] c'; return the bracketed one."""
+    v = read(prop, "")
+    if "[" in v:
+        return v[v.index("[") + 1:v.index("]")]
+    return v
+
+
+def gadget_superspeed():
+    try:
+        for name in os.listdir(UDC):
+            if read("%s/%s/current_speed" % (UDC, name), "").startswith("super"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def sdp_limit_ua(conf):
+    return conf["CHG_SDP_UA"] or (ICL_SDP_SS_UA if gadget_superspeed() else ICL_SDP_UA)
+
+
+# Last charger type detected on this connection. While the battery-care hold
+# suspends the charger input, the PMIC reports online=0 and usb_type Unknown
+# (it stops classifying the port), so without this a wall charger would read
+# as "USB port (SDP)" during the hold, and the input limit would briefly be
+# 0.5 A when charging resumes. Forgotten when the cable is unplugged.
+_seen = {"source": None, "saved": None}
+SOURCE_FILE = RUN_DIR + "/source.json"     # survives daemon restarts, not reboots
+
+
+def load_seen():
+    try:
+        with open(SOURCE_FILE) as f:
+            s = json.load(f)
+        _seen["source"] = _seen["saved"] = tuple(s) if s else None
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def save_seen():
+    if _seen["source"] != _seen["saved"]:
+        atomic_write(SOURCE_FILE, json.dumps(_seen["source"]) + "\n")
+        _seen["saved"] = _seen["source"]
+
+
+def source(conf):
+    """(kind, mV, mA, label); kind: none, sdp, cdp, dcp, pd."""
+    tc = typec_psy()
+    tc_online = bool(tc) and read_int(tc + "/online") == 1
+    chg_online = read_int(CHARGER + "/online") == 1
+    if not (chg_online or tc_online):
+        _seen["source"] = None
+        return ("none", 0, 0, "Not connected")
+    if tc_online and selected(tc + "/usb_type") in ("PD", "PD_PPS"):
+        mv = read_int(tc + "/voltage_now") // 1000 or read_int(tc + "/voltage_max") // 1000
+        ma = read_int(tc + "/current_max") // 1000
+        if ma > 0:
+            _seen["source"] = ("pd", mv, ma, "USB PD %g V %g A (%g W)" % (mv / 1000, ma / 1000, mv * ma / 1e6))
+            return _seen["source"]
+    t = selected(CHARGER + "/usb_type")
+    if t == "DCP":
+        _seen["source"] = ("dcp", 5000, ICL_DCP_UA // 1000, "USB wall charger (DCP) 5 V 1.8 A")
+        return _seen["source"]
+    if t == "CDP":
+        _seen["source"] = ("cdp", 5000, ICL_CDP_UA // 1000, "USB CDP port 5 V 1.5 A")
+        return _seen["source"]
+    if not chg_online and t in ("Unknown", "") and _seen["source"]:
+        return _seen["source"]          # input suspended: same charger as before
+    ma = sdp_limit_ua(conf) // 1000
+    _seen["source"] = ("sdp", 5000, ma, "USB port (SDP) 5 V %g A" % (ma / 1000))
+    return _seen["source"]
+
+
+class Policy:
+    """Charge window state machine (pure logic, testable without sysfs)."""
+
+    def __init__(self, conf, state):
+        self.conf, self.state = conf, state
+        self.holding = False          # input suspended because of the window
+        self.full_once = False
+        self.deep_active = False
+
+    def deep_due(self, now):
+        days = self.conf["DEEP_EVERY_DAYS"]
+        return days > 0 and now - self.state["last_deep"] >= days * 86400
+
+    def step(self, cap, plugged, now, full_flag=False, deep_flag=False):
+        """Return (suspend_input, mode, text). Updates self.state on events."""
+        c = self.conf
+        if full_flag:
+            self.full_once, self.holding = True, False
+        if deep_flag:
+            self.state["last_deep"] = 0           # make a deep cycle due now
+            if self.holding:
+                self.deep_active = True
+        if cap >= 0 and cap <= c["DEEP_MIN"]:
+            # reached the deep floor (plugged or not): a deep cycle happened
+            if self.deep_active or self.deep_due(now):
+                self.state["last_deep"] = now
+            self.deep_active = False
+        if self.full_once and cap >= 100:
+            self.full_once = False                # done; back to the window
+        if self.full_once and plugged:
+            return (False, "full", "charging to 100 % once")
+        if not plugged:
+            self.holding = False
+            return (False, "battery", "on battery")
+        if c["CHG_MAX"] >= 100:
+            return (False, "normal", "charging normally (no limit)")
+        if not self.holding and cap >= c["CHG_MAX"]:
+            self.holding = True
+            self.deep_active = self.deep_due(now)
+        if self.holding:
+            floor = c["DEEP_MIN"] if self.deep_active else c["CHG_RESUME"]
+            if cap <= floor:
+                self.holding = False
+                self.deep_active = False
+            else:
+                if self.deep_active:
+                    return (True, "deep", "deep cycle: running on battery down to %d %%" % floor)
+                return (True, "hold", "limit %d %%: running on battery down to %d %%" % (c["CHG_MAX"], floor))
+        return (False, "charging", "charging to %d %%" % c["CHG_MAX"])
+
+
+def consume(flag):
+    if os.path.exists(flag):
+        try:
+            os.unlink(flag)
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def usbin_adc():
+    """the PM8150B ADC directory with the usbin_i / usbin_v channels, or None"""
+    for d in sorted(glob.glob(ROOT + "/sys/bus/iio/devices/iio:device*")):
+        if os.path.exists(d + "/in_voltage_usbin_i_input"):
+            return d
+    return None
+
+
+def charger_sensor_w():
+    """raw input power from the charger's ADC: usbin_i in uA x usbin_v in uV
+    (e.g. 24848 uA, 5004496 uV). It follows the input but reads about 4-5x too
+    low (a mis-scaled channel on this kernel); Draw multiplies it by a factor
+    calibrated against the battery."""
+    d = usbin_adc()
+    if not d:
+        return None
+    ua = read_int(d + "/in_voltage_usbin_i_input", -1)
+    uv = read_int(d + "/in_voltage_usbin_v_input", -1)
+    return None if ua < 0 or uv < 0 else ua * uv / 1e12
+
+
+class Draw:
+    """The phone's own power draw, published as draw_w with draw_source:
+      "battery": the battery is discharging (unplugged, input suspended, or a
+                 calibration window), so its power *is* the phone's draw: exact;
+      "charger": on the charger, estimated from the charger's input sensor x
+                 the factor k. In the idle hold (charging inhibited) the input
+                 feeds only the phone; while charging, the battery's share is
+                 taken off.
+    k is calibrated every CAL_EVERY_S: a short window on battery gives the
+    exact draw, compared with the sensor's average just before it."""
+    def __init__(self, state):
+        self.w, self.at, self.live, self.source = None, 0, False, None
+        self.charge_w = 0.0
+        self.k = state.get("draw_k") or K_DEFAULT          # sensor -> phone W
+        self.k_at = state.get("draw_k_at", 0)              # 0: not calibrated yet
+        # raw sensor W while the battery is idle: the last minute of samples,
+        # started afresh (after a few settling samples) whenever it was not idle,
+        # so a charging spike or the input switching never leaks into the mean
+        self.idle_samples, self.settle = [], IDLE_SETTLE_N
+        self.sensor, self.sensor_n = None, 0
+
+    def idle_reset(self):
+        self.idle_samples, self.settle, self.sensor_n = [], IDLE_SETTLE_N, 0
+
+    def update(self, now, plugged):
+        ua = read_int(BATTERY + "/current_now", 0)          # + charging, - discharging
+        uv = read_int(BATTERY + "/voltage_now", 0)
+        p = ua * uv / 1e12
+        self.charge_w = round(max(p, 0.0), 3)
+        if p < -0.05:                                       # on battery: this is the phone
+            self.idle_reset()
+            a = min(1.0, POLL_S / 120.0)
+            w = -p if self.source != "battery" or now - self.at > 600 else self.w + a * (-p - self.w)
+            self.w, self.at, self.live, self.source = w, int(now), True, "battery"
+            return p
+        self.live = False
+        s = charger_sensor_w() if plugged else None
+        if s is None or s <= 0:
+            self.idle_reset()
+            return p
+        if p <= 0.05:                                       # battery idle: the input is the phone
+            if self.settle > 0:
+                self.settle -= 1
+                return p
+            self.idle_samples = (self.idle_samples + [s])[-max(1, 60 // POLL_S):]
+            self.sensor = sum(self.idle_samples) / len(self.idle_samples)
+            self.sensor_n = len(self.idle_samples)
+            est = self.sensor * self.k
+        else:                                               # charging: part of the input is the battery's
+            self.idle_reset()
+            est = s * self.k - p
+        if est > 0.05:
+            self.w, self.at, self.live, self.source = est, int(now), True, "charger"
+        return p
+
+
+def status_json(conf, policy, kind, mv, ma, label, cap, reason, mode, now, draw, live):
+    days = conf["DEEP_EVERY_DAYS"]
+    nxt = policy.state["last_deep"] + days * 86400 if days > 0 else 0
+    return {
+        "time": int(now), "source": kind, "source_label": label, "mV": mv, "mA": ma,
+        "battery_percent": cap, "mode": mode, "reason": reason,
+        "input_current_limit_uA": read_int(CHARGER + "/input_current_limit", 0),
+        "conf": conf, "last_deep": policy.state["last_deep"],
+        "next_deep": max(nxt, int(now)) if days > 0 else 0,
+        # phone draw in W (None until known), when, whether that is now, and
+        # how: "battery" (exact) or "charger" (sensor x draw_k, calibrated at
+        # draw_k_at, 0 = not yet); W going into the battery
+        "draw_w": None if draw.w is None else round(draw.w, 3), "draw_at": draw.at,
+        "draw_live": live, "draw_source": draw.source, "draw_k": round(draw.k, 3),
+        "draw_k_at": draw.k_at, "charge_w": draw.charge_w,
+        # how the hold is done: "inhibit" (battery idle) or "suspend" (on battery)
+        "hold_method": "inhibit" if os.path.exists(CHARGE_BEHAVIOUR) else "suspend",
+        "charge_behaviour": read(CHARGE_BEHAVIOUR, "").split("[")[-1].split("]")[0] or None,
+    }
+
+
+def cmd_status():
+    try:
+        with open(RUN_DIR + "/chgctrl.json") as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        print("guacamole-chgctrl is not running"); return
+    c = s["conf"]
+    print("%s" % s["source_label"])
+    print("battery: %d %%, %s" % (s["battery_percent"], read(BATTERY + "/status", "?")))
+    print("policy:  %s (%s)" % (s["reason"], s["mode"]))
+    print("window:  charge to %d %%, resume at %d %%, every %d days down to %d %%" % (
+        c["CHG_MAX"], c["CHG_RESUME"], c["DEEP_EVERY_DAYS"], c["DEEP_MIN"]))
+    print("hold:    %s" % ("charging inhibited, battery idle (charge_behaviour: %s)" % s.get("charge_behaviour")
+                           if s.get("hold_method") == "inhibit" else "charger input suspended, phone on battery"))
+    if s["next_deep"]:
+        print("next deep cycle due: %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(s["next_deep"])))
+    if s.get("draw_w") is not None:
+        age = int(time.time()) - s.get("draw_at", 0)
+        how = ("measured on the battery" if s.get("draw_source") == "battery" else
+               "estimated from the charger sensor x %.2f" % s.get("draw_k", 0))
+        print("phone draw: %.2f W, %s%s" % (s["draw_w"], how, "" if s.get("draw_live") else
+                                             " (%d min ago)" % (age // 60)))
+        ka = s.get("draw_k_at") or 0
+        print("estimate calibrated: %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(ka)) if ka else
+                                          "not yet (within a few minutes of holding)"))
+    if s.get("calibrating"):
+        print("calibrating now: about a minute on battery")
+    if s.get("charge_w"):
+        print("charging: %.2f W into the battery" % s["charge_w"])
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "status":
+        cmd_status(); return
+
+    reload_flag = {"v": False}
+
+    def on_hup(*_):
+        reload_flag["v"] = True
+
+    def on_term(*_):
+        write(CHARGER + "/status", 1)       # never leave the input suspended ...
+        if os.path.exists(CHARGE_BEHAVIOUR):
+            write(CHARGE_BEHAVIOUR, "auto")  # ... or charging inhibited
+        sys.exit(0)
+
+    signal.signal(signal.SIGHUP, on_hup)
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+
+    conf = load_conf()
+    state = load_state()
+    if not state["last_deep"]:
+        state["last_deep"] = int(time.time())   # first run: first deep cycle in N days
+        save_state(state)
+    policy = Policy(conf, state)
+    draw = Draw(state)
+    cal = {"phase": None, "until": 0, "samples": [], "sensor": None}   # power-estimate calibration
+    load_seen()
+    hot = warm = False
+    last_line, last_icl, last_saved = None, None, dict(state)
+
+    while True:
+        if reload_flag["v"]:
+            reload_flag["v"] = False
+            conf = load_conf(); policy.conf = conf
+            print("chgctrl: config reloaded: %s" % conf, flush=True)
+        now = time.time()
+        kind, mv, ma, label = source(conf)
+        save_seen()
+        cap = battery_percent()
+        temp = read_int(BATTERY + "/temp", 250)
+
+        hot = temp >= TEMP_HOT or (hot and temp >= TEMP_HOT - TEMP_HYST)
+        warm = temp >= TEMP_WARM or (warm and temp >= TEMP_WARM - TEMP_HYST)
+
+        win_hold, mode, reason = policy.step(
+            cap, kind != "none", now, consume(FLAG_FULL), consume(FLAG_DEEP))
+        plugged = kind != "none"
+        can_inhibit = os.path.exists(CHARGE_BEHAVIOUR)
+        # the window's hold: inhibit charging (battery idle, the charger powers
+        # the phone) where the kernel can; a deep cycle must really discharge,
+        # and older kernels can only suspend the input
+        inhibit = plugged and win_hold and can_inhibit and mode != "deep" and not hot
+        suspend = plugged and (hot or (win_hold and not inhibit))
+        if inhibit:
+            reason = "limit %d %%: battery idle at %d %%, the charger powers the phone (charging again below %d %%)" % (
+                conf["CHG_MAX"], cap, conf["CHG_RESUME"] + 1)
+        if plugged and hot:
+            reason = "input suspended: battery %.1f C" % (temp / 10)
+        elif plugged and warm and not suspend:
+            reason += ", throttled to 1 A: battery %.1f C" % (temp / 10)
+
+        # calibrating the power estimate: every CAL_EVERY_S, while the hold keeps
+        # the battery idle, suspend the input for a short window so the battery
+        # gives the exact draw; abandoned if the situation changes
+        if cal["phase"] is None and inhibit and draw.sensor_n >= CAL_MIN_SENSOR_N \
+                and now - draw.k_at >= CAL_EVERY_S:
+            cal.update(phase="settle", until=now + CAL_SETTLE_S, samples=[], sensor=draw.sensor)
+            print("chgctrl: calibrating the power estimate (%d s on battery)" % CAL_MEASURE_S, flush=True)
+        if cal["phase"] and not inhibit:
+            cal["phase"] = None
+        if cal["phase"]:
+            suspend = True
+            reason += "; calibrating the power estimate (%d s on battery)" % CAL_MEASURE_S
+
+        write(CHARGER + "/status", 0 if suspend else 1)
+        # compare with what the driver reports, not what was last written, so a
+        # change from elsewhere is undone too (the driver logs every write)
+        cb = "inhibit-charge" if inhibit else "auto"
+        if can_inhibit and selected(CHARGE_BEHAVIOUR) != cb:
+            write(CHARGE_BEHAVIOUR, cb)
+        icl = {"pd": min(ma * 1000, ICL_PD_MAX_UA), "dcp": ICL_DCP_UA,
+               "cdp": ICL_CDP_UA, "sdp": sdp_limit_ua(conf)}.get(kind)
+        if icl is not None and warm:
+            icl = min(icl, ICL_HOT_UA)
+        if icl is not None and not suspend and (icl != last_icl or kind == "sdp"):
+            if write(CHARGER + "/input_current_limit", icl):
+                last_icl = icl
+        if kind == "none" or suspend:
+            last_icl = None
+
+        if policy.state != last_saved:
+            save_state(policy.state); last_saved = dict(policy.state)
+        p = draw.update(now, plugged and not suspend)     # the sensor reads 0 with the input suspended
+        if cal["phase"] == "settle" and now >= cal["until"]:
+            cal.update(phase="measure", until=now + CAL_MEASURE_S)
+        elif cal["phase"] == "measure":
+            if p < -0.05:
+                cal["samples"].append(-p)
+            if now >= cal["until"]:
+                n = len(cal["samples"])
+                if n >= max(3, CAL_MEASURE_S // POLL_S // 2) and cal["sensor"]:
+                    k_new = sum(cal["samples"]) / n / cal["sensor"]
+                    if K_RANGE[0] <= k_new <= K_RANGE[1]:
+                        # blend, so one noisy window cannot throw the estimate off
+                        draw.k = k_new if not draw.k_at else 0.6 * draw.k + 0.4 * k_new
+                        print("chgctrl: power estimate calibrated: phone %.3f W on battery, sensor %.3f W "
+                              "-> factor %.2f (using %.2f)" % (sum(cal["samples"]) / n, cal["sensor"], k_new, draw.k),
+                              flush=True)
+                    else:
+                        print("chgctrl: calibration rejected: factor %.2f out of range" % k_new, flush=True)
+                else:
+                    print("chgctrl: calibration skipped: the battery did not discharge", flush=True)
+                draw.k_at = int(now)
+                policy.state["draw_k"], policy.state["draw_k_at"] = round(draw.k, 3), draw.k_at
+                draw.sensor_n = 0                  # a fresh idle average before the next one
+                cal["phase"] = None
+        st = status_json(conf, policy, kind, mv, ma, label, cap, reason, mode, now, draw, draw.live)
+        st["calibrating"] = bool(cal["phase"])
+        atomic_write(RUN_DIR + "/chgctrl.json", json.dumps(st) + "\n")
+        line = "%s %d %d %.1f %s | %s" % (kind, mv, ma, mv * ma / 1e6, label, reason)
+        if line != last_line:
+            atomic_write(RUN_DIR + "/charger", line + "\n")
+            print("chgctrl: %d%% %s" % (cap, line), flush=True)
+            last_line = line
+        time.sleep(POLL_S)
+
+
+if __name__ == "__main__":
+    main()

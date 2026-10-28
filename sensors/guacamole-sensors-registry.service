@@ -1,0 +1,7 @@
+[Unit]
+Description=Populate the OnePlus 7 Pro sensor registry for hexagonrpcd
+Before=hexagonrpcd-sdsp.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/guacamole-sensors-registry

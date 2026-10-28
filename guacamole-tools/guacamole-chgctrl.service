@@ -1,0 +1,14 @@
+[Unit]
+Description=OnePlus 7 Pro charge policy (PD input limit, thermal, 80 % battery-care window)
+After=systemd-udev-settle.service
+ConditionPathExists=/sys/class/power_supply/pm8150b-charger
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/guacamole-chgctrl
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

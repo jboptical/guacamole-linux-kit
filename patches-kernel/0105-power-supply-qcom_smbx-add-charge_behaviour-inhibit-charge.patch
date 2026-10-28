@@ -1,0 +1,109 @@
+From: Guacamole kit <guacamole@localhost>
+Subject: [PATCH] power: supply: qcom_smbx: add charge_behaviour (auto, inhibit-charge)
+
+Expose CHARGING_ENABLE_CMD as the standard charge_behaviour property, so
+userspace can keep the battery at a fixed charge while USB powers the
+system (inhibit-charge), instead of suspending USBIN, which makes the
+device run from (and cycle) the battery. Probe still enables charging,
+so the default after a boot is auto.
+---
+--- a/drivers/power/supply/qcom_smbx.c
++++ b/drivers/power/supply/qcom_smbx.c
+@@ -301,6 +301,7 @@
+ 	POWER_SUPPLY_PROP_HEALTH,
+ 	POWER_SUPPLY_PROP_ONLINE,
+ 	POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+ };
+ 
+ static int smb_get_prop_usb_online(struct smb_chip *chip, int *val)
+@@ -682,6 +683,54 @@
+ 	}
+ }
+ 
++/*
++ * charge_behaviour: "inhibit-charge" clears CHARGING_ENABLE_CMD, so the battery
++ * is neither charged nor (while USB can supply the load) discharged: the input
++ * keeps powering the system. Unlike suspending USBIN (status = 0), the battery
++ * just sits at its current charge, which is what a device kept on a charger
++ * all the time wants. Probe enables charging again, so the default after a
++ * boot is "auto".
++ */
++static int smb_get_charge_behaviour(struct smb_chip *chip, int *val)
++{
++	unsigned int cmd;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD, &cmd);
++	if (rc < 0)
++		return rc;
++
++	*val = (cmd & CHARGING_ENABLE_CMD_BIT) ? POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
++						    POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++	return 0;
++}
++
++static int smb_set_charge_behaviour(struct smb_chip *chip, int val)
++{
++	unsigned int bit;
++	int rc;
++
++	switch (val) {
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
++		bit = CHARGING_ENABLE_CMD_BIT;
++		break;
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
++		bit = 0;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	rc = regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
++				CHARGING_ENABLE_CMD_BIT, bit);
++	if (rc < 0)
++		return rc;
++
++	dev_info(chip->dev, "charging %s\n", bit ? "enabled" : "inhibited");
++	power_supply_changed(chip->chg_psy);
++	return 0;
++}
++
+ static int smb_get_property(struct power_supply *psy,
+ 			     enum power_supply_property psp,
+ 			     union power_supply_propval *val)
+@@ -718,6 +767,8 @@
+ 		return smb_get_prop_health(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_USB_TYPE:
+ 		return smb_apsd_get_charger_type(chip, &val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		return smb_get_charge_behaviour(chip, &val->intval);
+ 	default:
+ 		dev_err(chip->dev, "invalid property: %d\n", psp);
+ 		return -EINVAL;
+@@ -737,6 +788,8 @@
+ 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+ 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+ 		return smb_set_current_limit(chip, val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		return smb_set_charge_behaviour(chip, val->intval);
+ 	default:
+ 		dev_err(chip->dev, "No setter for property: %d\n", psp);
+ 		return -EINVAL;
+@@ -750,6 +803,7 @@
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+ 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+ 		return 1;
+ 	default:
+ 		return 0;
+@@ -927,6 +981,8 @@
+ static const struct power_supply_desc smb_psy_desc = {
+ 	.name = "SMB2_charger",
+ 	.type = POWER_SUPPLY_TYPE_USB,
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
+ 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |

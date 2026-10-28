@@ -1,0 +1,31 @@
+diff --git a/drivers/usb/dwc3/dwc3-generic.c b/drivers/usb/dwc3/dwc3-generic.c
+index 3f6e3d40..168a33ce 100644
+--- a/drivers/usb/dwc3/dwc3-generic.c
++++ b/drivers/usb/dwc3/dwc3-generic.c
+@@ -518,8 +518,24 @@ static void dwc3_qcom_glue_configure(struct udevice *dev, int index,
+ 		return;
+ 	}
+ 
+-	if (dev_read_bool(dev, "qcom,select-utmi-as-pipe-clk"))
+-		dwc3_qcom_select_utmi_clk(qscratch_base);
++	/*
++	 * The snapdragon OF fixup writes "qcom,select-utmi-as-pipe-clk" on the
++	 * dwc3 node. With the non-flattened DT layout that is a child of the
++	 * glue node, so look there too; otherwise the core waits for a PIPE
++	 * clock from the (driverless) SS PHY and endpoint commands time out
++	 * ("failed to enable ep0out", -110) unless an earlier bootloader
++	 * already configured QSCRATCH.
++	 */
++	{
++		bool utmi_pipe = dev_read_bool(dev, "qcom,select-utmi-as-pipe-clk");
++		ofnode child;
++
++		ofnode_for_each_subnode(child, dev_ofnode(dev))
++			if (ofnode_read_bool(child, "qcom,select-utmi-as-pipe-clk"))
++				utmi_pipe = true;
++		if (utmi_pipe)
++			dwc3_qcom_select_utmi_clk(qscratch_base);
++	}
+ 
+ 	if (mode != USB_DR_MODE_HOST)
+ 		dwc3_qcom_vbus_override_enable(qscratch_base, true);
