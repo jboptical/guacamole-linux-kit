@@ -2,7 +2,8 @@
 # Install Arch Linux ARM on the OnePlus 7 Pro from a Linux PC or WSL2, with the
 # phone in U-Boot "USB mass storage" mode (see README, steps 4 and 5).
 #
-#   sudo bash scripts/install-arch.sh --disk /dev/sdX [--gui | --headless]
+#   sudo bash scripts/install-arch.sh [--gui | --headless]
+#        [--disk /dev/sdX]      # default: finds the phone's disk itself and asks
 #        [--partition]          # first split userdata into userdata + esp + linux1
 #                               # (DESTROYS ANDROID USER DATA; once only)
 #        [--kernel build/guacamole-kernel-<rel>.tar.gz]   # default: newest in build/
@@ -22,8 +23,33 @@ while [ $# -gt 0 ]; do case "$1" in
   --partition) PART=1; shift;; --kernel) KPKG=$2; shift 2;; --firmware) FWTAR=$2; shift 2;;
   *) die "unknown arg $1 (see the top of this script)";; esac; done
 [ "$(id -u)" = 0 ] || die "run with sudo"
-[ -b "${DISK:-}" ] || die "--disk /dev/sdX (the phone's disk: ~238 GB (256 GB model) or ~119 GB (128 GB model), 4096-byte sectors) is required"
 for t in curl md5sum lsblk blkid; do command -v $t >/dev/null || die "missing $t"; done
+
+# The phone's disk (UFS LUN0 in U-Boot mass-storage mode): 4096-byte sectors,
+# a 'persist' partition, lsblk shows about 234G (256 GB model; 251.5 GB) or about 117G (128 GB model)
+is_phone() {
+  [ "$(lsblk -dno LOG-SEC "$1" 2>/dev/null | tr -d ' ')" = 4096 ] &&
+    lsblk -lno PARTLABEL "$1" 2>/dev/null | grep -qx persist
+}
+describe() { lsblk -dno SIZE,MODEL "$1" | sed 's/  */ /g; s/^ //; s/ *$//'; }
+if [ -z "$DISK" ]; then
+  types="disk"; [ "${GUAC_ALLOW_LOOP:-0}" = 1 ] && types="disk loop"   # loop: for tests only
+  found=()
+  while read -r name type; do
+    case " $types " in *" $type "*) is_phone "$name" && found+=("$name") ;; esac
+  done < <(lsblk -dnpo NAME,TYPE)
+  case ${#found[@]} in
+    0) die "no phone disk found. Is the phone in U-Boot 'USB mass storage' mode (and attached to WSL with wsl-attach-phone.ps1)? Check with: lsblk -d -o NAME,SIZE,LOG-SEC,MODEL" ;;
+    1) DISK=${found[0]} ;;
+    *) die "more than one possible phone disk (${found[*]}); pick one with --disk" ;;
+  esac
+  echo "Found the phone's disk: $DISK ($(describe "$DISK"), 4096-byte sectors, has 'persist')"
+  read -r -p "Install to $DISK? [y/N] " a; [ "$a" = y ] || die "aborted"
+else
+  [ -b "$DISK" ] || die "$DISK is not a disk"
+  is_phone "$DISK" || die "$DISK is not the phone's disk (needs 4096-byte sectors and a 'persist' partition). Leave out --disk to find it automatically"
+  echo "Phone disk: $DISK ($(describe "$DISK"))"
+fi
 
 KPKG=${KPKG:-$(ls -t "$PWD"/build/guacamole-kernel-*.tar.gz "$KIT"/build/guacamole-kernel-*.tar.gz 2>/dev/null | head -1 || true)}
 [ -f "$KPKG" ] || die "no kernel package: run scripts/build-kernel.sh first, or pass --kernel"

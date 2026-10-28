@@ -84,5 +84,5 @@ if ($line -notmatch 'Attached') {
 Write-Host "Disks seen by WSL:"
 & wsl --exec lsblk -o NAME,SIZE,LOG-SEC,PARTLABEL
 Write-Host ""
-Write-Host "The phone is the ~234G disk with LOG-SEC 4096 and partitions like 'persist' and 'userdata'."
+Write-Host "The phone is the ~234G disk (~117G on the 128 GB model) with LOG-SEC 4096 and partitions like 'persist' and 'userdata'."
 Write-Host "If no such disk appears, use a live Ubuntu USB stick instead (WSL kernel without usb-storage)."

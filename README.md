@@ -162,19 +162,20 @@ bash scripts/build-firmware.sh ~/lineage-*-guacamole-signed.zip     # -> build/g
 
 1. **Put the phone in mass-storage mode.** Boot to U-Boot, hold Vol Down, and choose **Enable USB mass storage**.
    **When Windows offers to format or initialise the disk, click Cancel. Never accept.**
-2. **Find the disk.**
+2. **Connect the disk.**
    - **WSL:** attach it from an admin PowerShell:
      ```powershell
      powershell -ExecutionPolicy Bypass -File .\scripts\wsl-attach-phone.ps1
      ```
-   - **Linux PC:** it simply appears. Check `lsblk`.
-
-   The phone is the disk with 4096-byte sectors and a `persist` partition, about 238 GB on the 256 GB model or about 119 GB on the 128 GB model, for example `/dev/sdd`.
-3. **Install** (Linux or WSL). `--partition` is only for the first time: it splits `userdata` into a 4 GiB placeholder, a 1 GiB ESP and `linux1` (the rest), after asking you to type `ERASE-USERDATA`.
+   - **Linux PC:** it simply appears.
+3. **Install** (Linux or WSL). Pick one:
    ```bash
-   sudo bash scripts/install-arch.sh --disk /dev/sdX --partition --gui        # KDE Plasma desktop
-   sudo bash scripts/install-arch.sh --disk /dev/sdX --partition --headless   # no desktop (server)
+   sudo bash scripts/install-arch.sh --partition --gui        # KDE Plasma desktop
+   sudo bash scripts/install-arch.sh --partition --headless   # no desktop (server)
    ```
+   - **Finding the disk:** the installer finds the phone's disk by itself: the only disk with 4096-byte sectors and a `persist` partition. It shows the disk's name, size and model, and waits for you to type `y`. If it finds none, or more than one, it stops.
+   - **Checking by hand:** run `lsblk -d -o NAME,SIZE,LOG-SEC,MODEL`. The phone is the line with `LOG-SEC 4096`, about **234G** on the 256 GB model (about **117G** on the 128 GB model; estimated, not seen yet). Then pass it with `--disk /dev/sdX`.
+   - **`--partition`** is only for the first install. It splits `userdata` into a 4 GiB placeholder, a 1 GiB ESP and `linux1` (the rest), after asking you to type `ERASE-USERDATA`. To reinstall later, leave it out.
 4. **Release the disk and reboot the phone.**
    - **WSL:** detach it with `.\scripts\wsl-attach-phone.ps1 -Detach`.
    - **Linux PC:** run `sync`.
@@ -263,7 +264,7 @@ On a headless install, only the services and `guac` are installed. To install th
 - Every individual setup script (`setup-qcom`, `personalize-dtb`, `setup-audio`, `setup-chrony`, `setup-sensors`, `setup-desktop-arch`, lightly adapted for the kit) and guacamole-tools. The author's install was done step by step with these scripts, from Arch Linux ARM with Plasma.
 
 **Tested off the phone:**
-- `install-arch.sh` (with `--partition`, `--gui` and `--headless`) and `partition-ufs.sh`, run in WSL against sparse 238 GB and 119 GB disks laid out like the phone's. This covered partitioning, the rootfs, kernel, boot entry, device tree and kit copy.
+- `install-arch.sh` (with `--partition`, `--gui` and `--headless`) and `partition-ufs.sh`, run in WSL against sparse disks the size of both models laid out like the phone's. This covered partitioning, the rootfs, kernel, boot entry, device tree and kit copy.
 
 **Not yet run on a fresh phone:**
 - The all-in-one `setup-arch.sh` and the new `setup-network.sh`. They run the scripts above in order, plus the internet-through-the-PC bootstrap.
